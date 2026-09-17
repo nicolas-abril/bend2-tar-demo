@@ -1,5 +1,11 @@
 # tar
 
+Standalone repository: [nicolas-abril/bend2-tar-demo](https://github.com/nicolas-abril/bend2-tar-demo).
+Extracted from `bend3-demos/tar` with its Git history.
+
+Requires the `bend` CLI on `PATH` and a C compiler. With a neighboring
+`bend2-core` checkout, use `make BEND="bun ../bend2-core/bend2/main.ts"`.
+
 A bsdtar-style archiver in Bend: create, list and extract ustar archives,
 gzip'd or not, with a DEFLATE encoder (dynamic Huffman over LZ77) and
 decoder written in Bend. `tar.c` is the C twin: the same layout, container,
