@@ -34,12 +34,16 @@ Term words_read_run(Env e, Term* f, IoWork* w) {
   }
   Term arr = blk_new(e, 0, d, 0, 0, NULL);
   Loc loc = term_loc(arr);
-  for (uint64_t i = 0; i < len; i += 4) {
-    uint32_t w = 0;
-    for (uint64_t k = 0; k < 4 && i + k < len; k += 1) {
-      w |= (uint32_t)buf[i + k] << (8 * k);
-    }
-    blk_write(e.mem, 0, loc, (u32)(i >> 2), w);
+  uint64_t full = len >> 2;
+  for (uint64_t i = 0; i < full; i += 1) {
+    uint32_t word;
+    memcpy(&word, buf + i * 4, sizeof(word));
+    blk_write(e.mem, 0, loc, (u32)i, word);
+  }
+  if ((len & 3) != 0) {
+    uint32_t word = 0;
+    memcpy(&word, buf + full * 4, len & 3);
+    blk_write(e.mem, 0, loc, (u32)full, word);
   }
   free(buf);
   return io_done(e, io_tup(e, arr, (Term)len));

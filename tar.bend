@@ -340,6 +340,10 @@ def File.write_words(file: File, a: Array<U32>, +start: U32, +n: U32) -> IO(File
   import "./effs/file_words_write.c"
   import "./effs/file_words_write.js"
 
+def File.read_words_at(file: File, +offset: U32, +max: U32) -> IO(File & Result<&1, &1, U32 & String, Array<U32> & U32>):
+  import "./effs/file_words_read_at.c"
+  import "./effs/file_words_read_at.js"
+
 def output_open(path: String) -> IO(Result<&1, &1, U32 & String, File>):
   import "./effs/output_open.c"
   import "./effs/output_open.js"
@@ -429,6 +433,20 @@ def open_out(+path: String) -> IO(File):
   do IO<File>:
     r : Result<&1, &1, U32 & String, File> <- output_open(path)
     open_got(path, r)
+
+type Fr is Type:
+  Fr{file: File, a: Array<U32>, n: U32}
+
+def file_read_words_got(what: String, r: File & Result<&1, &1, U32 & String, Array<U32> & U32>) -> IO(Fr):
+  (file, v) = r
+  match v:
+    case Done{(a, n)}:
+      IO.pure(Fr, Fr{file, a, n})
+    case Fail{e}:
+      do IO<Fr>:
+        Unit <- File.close(file)
+        Unit <- io_fail(what, e)
+        IO.die(Fr, 1, "unreachable")
 
 def file_words_got(what: String, r: File & Array<U32> & Result<&1, &1, U32 & String, Unit>) -> IO(File):
   (file, a, v) = r
@@ -840,7 +858,7 @@ def br_align(br: Br) -> Br:
 # peeked 15-bit window, walking the lengths
 
 type Huf is Type:
-  Huf{cnt: Array<U32>, sym: Array<U32>}
+  Huf{cnt: Array<U32>, sym: Array<U32>, fast: Array<U32>}
 
 # count the lengths: cnt[len[i]] += 1
 type Cs is Type:
@@ -910,15 +928,93 @@ def place_loop(n: Nat, st: Pl, +i: U32) -> Pl:
     case 1n+p, Pl{lens, offs, sym}:
       place_loop(p, place_at(Array.get(U32, lens, i), offs, sym, i), (i + 1 : U32))
 
-def huf_of_pl(st: Pl, cnt: Array<U32>) -> Huf:
+# A nine-bit primary decode table. Entries pack code length in the high half
+# and symbol in the low half; zero means that a longer code needs the canonical
+# fallback walk.
+def hrev(n: Nat, +c: U32, +acc: U32) -> U32:
+  match n:
+    case 0n:
+      acc
+    case 1n+p:
+      hrev(p, (c >> 1n : U32), ((acc << 1n) .|. (c .&. 1) : U32))
+
+def hfast_fill(n: Nat, fast: Array<U32>, +at: U32, +step: U32, +v: U32) -> Array<U32>:
+  match n:
+    case 0n:
+      fast
+    case 1n+p:
+      hfast_fill(p, Array.set(U32, fast, at, v), (at + step : U32), step, v)
+
+type Hn is Type:
+  Hn{cnt: Array<U32>, next: Array<U32>}
+
+def hn_at(r: Array<U32> & U32, next: Array<U32>, +l: U32, +code: U32) -> Hn & U32:
+  (cnt, c) = r
+  +cd = ((code + c) << 1n : U32)
+  (Hn{cnt, Array.set(U32, next, (l + 1 : U32), cd)}, cd)
+
+def hn_loop(n: Nat, st: Hn & U32, +l: U32) -> Hn:
+  match n, st:
+    case 0n, (r, code):
+      r
+    case 1n+p, (Hn{cnt, next}, code):
+      hn_loop(p, hn_at(Array.get(U32, cnt, l), next, l, code), (l + 1 : U32))
+
+def hn_next(st: Hn) -> Array<U32>:
+  match st:
+    case Hn{cnt, next}:
+      next
+
+type Hf is Type:
+  Hf{lens: Array<U32>, next: Array<U32>, fast: Array<U32>}
+
+def hf_code(r: Array<U32> & U32, lens: Array<U32>, fast: Array<U32>, +i: U32, +l: U32) -> Hf:
+  (next, code) = r
+  +cc = code
+  +rev = hrev(U32.to_nat(l), cc, 0)
+  +count = U32.shln(1, U32.to_nat((9 - l : U32)))
+  Hf{lens, Array.set(U32, next, l, (cc + 1 : U32)), hfast_fill(U32.to_nat(count), fast, rev, U32.shln(1, U32.to_nat(l)), ((l << 16n) .|. i : U32))}
+
+def hf_live(lens: Array<U32>, next: Array<U32>, fast: Array<U32>, +i: U32, +l: U32, live: Bool) -> Hf:
+  match live:
+    case True{}:
+      hf_code(Array.get(U32, next, l), lens, fast, i, l)
+    case False{}:
+      Hf{lens, next, fast}
+
+def hf_at(r: Array<U32> & U32, next: Array<U32>, fast: Array<U32>, +i: U32) -> Hf:
+  (lens, l) = r
+  +ll = l
+  hf_live(lens, next, fast, i, ll, U32.is_ne(ll, 0) && U32.is_le(ll, 9))
+
+def hf_loop(n: Nat, st: Hf, +i: U32) -> Hf:
+  match n, st:
+    case 0n, r:
+      r
+    case 1n+p, Hf{lens, next, fast}:
+      hf_loop(p, hf_at(Array.get(U32, lens, i), next, fast, i), (i + 1 : U32))
+
+def hf_fast(st: Hf) -> Array<U32>:
+  match st:
+    case Hf{lens, next, fast}:
+      fast
+
+def hfast_of(lens: Array<U32>, cnt: Array<U32>, +n: U32) -> Array<U32>:
+  hf_fast(hf_loop(U32.to_nat(n), Hf{lens, hn_next(hn_loop(15n, (Hn{Array.set(U32, cnt, 0, 0), Array.new(U32, 4n, 0)}, 0), 0)), Array.new(U32, 9n, 0)}, 0))
+
+def huf_with_fast(r: Array<U32> & Array<U32>, lens: Array<U32>, sym: Array<U32>, +n: U32) -> Huf:
+  (cnt, code_cnt) = r
+  Huf{cnt, sym, hfast_of(lens, code_cnt, n)}
+
+def huf_of_pl(st: Pl, cnt: Array<U32>, +n: U32) -> Huf:
   match st:
     case Pl{lens, offs, sym}:
-      Huf{cnt, sym}
+      huf_with_fast(Array.fork(U32, cnt), lens, sym, n)
 
 def huf_of_of(st: Of, lens: Array<U32>, +n: U32) -> Huf:
   match st:
     case Of{cnt, offs}:
-      huf_of_pl(place_loop(U32.to_nat(n), Pl{lens, offs, Array.new(U32, 9n, 0)}, 0), cnt)
+      huf_of_pl(place_loop(U32.to_nat(n), Pl{lens, offs, Array.new(U32, 9n, 0)}, 0), cnt, n)
 
 def huf_of_cs(st: Cs, +n: U32) -> Huf:
   match st:
@@ -956,23 +1052,47 @@ def hl_loop(n: Nat, st: Hl) -> Hl:
 type Hd is Type:
   Hd{br: Br, h: Huf, sym: U32}
 
-def hd_of(rs: Array<U32> & U32, cnt: Array<U32>, a: Array<U32>, +pos: U32, +n: U32, +buf: U32, +bits: U32, +len: U32) -> Hd:
+def hd_of(rs: Array<U32> & U32, cnt: Array<U32>, fast: Array<U32>, a: Array<U32>, +pos: U32, +n: U32, +buf: U32, +bits: U32, +len: U32) -> Hd:
   (sym, v) = rs
-  Hd{Br{a, pos, n, U32.shrn(buf, U32.to_nat(len)), (bits - len : U32)}, Huf{cnt, sym}, v}
+  Hd{Br{a, pos, n, U32.shrn(buf, U32.to_nat(len)), (bits - len : U32)}, Huf{cnt, sym, fast}, v}
 
-def hd_at(st: Hl, sym: Array<U32>, a: Array<U32>, +pos: U32, +n: U32, +bits: U32) -> Hd:
+def hd_at(st: Hl, sym: Array<U32>, fast: Array<U32>, a: Array<U32>, +pos: U32, +n: U32, +bits: U32) -> Hd:
   match st:
     case Hl{cnt, buf, len, code, first, index, at, hit}:
-      hd_of(Array.get(U32, sym, at), cnt, a, pos, n, buf, bits, len)
+      hd_of(Array.get(U32, sym, at), cnt, fast, a, pos, n, buf, bits, len)
 
 def huf_walk(br: Br, h: Huf) -> Hd:
   match br, h:
-    case Br{a, pos, n, buf, cnt}, Huf{hc, sym}:
+    case Br{a, pos, n, buf, cnt}, Huf{hc, sym, fast}:
       +b = buf
-      hd_at(hl_loop(15n, Hl{hc, b, 0, 0, 0, 0, 0, False{}}), sym, a, pos, n, cnt)
+      hd_at(hl_loop(15n, Hl{hc, b, 0, 0, 0, 0, 0, False{}}), sym, fast, a, pos, n, cnt)
+
+def hd_fast(br: Br, cnt: Array<U32>, sym: Array<U32>, fast: Array<U32>, +v: U32) -> Hd:
+  match br:
+    case Br{a, pos, n, buf, bits}:
+      +len = (v >> 16n : U32)
+      Hd{Br{a, pos, n, U32.shrn(buf, U32.to_nat(len)), (bits - len : U32)}, Huf{cnt, sym, fast}, (v .&. 65535 : U32)}
+
+def huf_fast_run(fast: Array<U32>, br: Br, cnt: Array<U32>, sym: Array<U32>, +v: U32, hit: Bool) -> Hd:
+  match hit:
+    case True{}:
+      hd_fast(br, cnt, sym, fast, v)
+    case False{}:
+      huf_walk(br, Huf{cnt, sym, fast})
+
+def huf_fast_pick(r: Array<U32> & U32, br: Br, cnt: Array<U32>, sym: Array<U32>) -> Hd:
+  (fast, v) = r
+  +vv = v
+  huf_fast_run(fast, br, cnt, sym, vv, U32.is_ne(vv, 0))
+
+def huf_fast_at(br: Br, h: Huf) -> Hd:
+  match br, h:
+    case Br{a, pos, n, buf, bits}, Huf{cnt, sym, fast}:
+      +b = buf
+      huf_fast_pick(Array.get(U32, fast, (b .&. 511 : U32)), Br{a, pos, n, b, bits}, cnt, sym)
 
 def huf_decode(br: Br, h: Huf) -> Hd:
-  huf_walk(br_ready(br, 15), h)
+  huf_fast_at(br_ready(br, 15), h)
 
 # Inflate
 # -------
@@ -1010,8 +1130,9 @@ def fix_lens(n: Nat, a: Array<U32>, +i: U32) -> Array<U32>:
     case 1n+p:
       fix_lens(p, Array.set(U32, a, i, fix_len(i)), (i + 1 : U32))
 
-# the inflate state: reader, output array and its capacity, the write
-# position, and whether the last block has been read
+# The inflate output is packed four bytes per word. Its exact byte capacity
+# comes from the gzip ISIZE trailer, so decoding neither grows a byte-per-word
+# array nor makes a second pass to pack it afterwards.
 type Inf is Type:
   Inf{br: Br, out: Array<U32>, cap: U32, pos: U32, last: Bool}
 
@@ -1027,9 +1148,32 @@ def fixed_tables() -> Hs:
 # after LEN and NLEN the reader is byte aligned and empty, so the bytes
 # come straight from the words
 
+def inf_put_got(r: Array<U32> & U32, +pos: U32, +b: U32) -> Array<U32>:
+  (out, old) = r
+  Array.set(U32, out, (pos >> 2n : U32), (old .|. U32.shln(b, U32.to_nat(((pos .&. 3) << 3n : U32))) : U32))
+
+def inf_put(out: Array<U32>, +pos: U32, +b: U32) -> Array<U32>:
+  inf_put_got(Array.get(U32, out, (pos >> 2n : U32)), pos, b)
+
+def inf_word_split(out: Array<U32>, +q: U32, +v: U32, +sh: U32, split: Bool) -> Array<U32>:
+  match split:
+    case True{}:
+      Array.set(U32, out, (q + 1 : U32), U32.shrn(v, U32.to_nat((32 - sh : U32))))
+    case False{}:
+      out
+
+def inf_word_got(r: Array<U32> & U32, +pos: U32, +q: U32, +sh: U32, +v: U32) -> Array<U32>:
+  (out, old) = r
+  inf_word_split(Array.set(U32, out, q, (old .|. U32.shln(v, U32.to_nat(sh)) : U32)), q, v, sh, U32.is_ne(sh, 0))
+
+def inf_word(out: Array<U32>, +pos: U32, +v: U32) -> Array<U32>:
+  +q = (pos >> 2n : U32)
+  +sh = ((pos .&. 3) << 3n : U32)
+  inf_word_got(Array.get(U32, out, q), pos, q, sh, v)
+
 def stored_put(r: Array<U32> & U32, +pos: U32, +n: U32, out: Array<U32>, +cap: U32, +at: U32, last: Bool) -> Inf:
   (a, b) = r
-  Inf{Br{a, (pos + 1 : U32), n, 0, 0}, Array.set(U32, out, at, b), cap, (at + 1 : U32), last}
+  Inf{Br{a, (pos + 1 : U32), n, 0, 0}, inf_put(out, at, b), cap, (at + 1 : U32), last}
 
 def stored_byte(br: Br, out: Array<U32>, +cap: U32, +pos: U32, last: Bool) -> Inf:
   match br:
@@ -1044,13 +1188,33 @@ def stored_copy(n: Nat, st: Inf) -> Inf:
     case 1n+p, Inf{br, out, cap, pos, last}:
       stored_copy(p, stored_byte(br, out, cap, pos, last))
 
+def stored_word(r: Array<U32> & U32, +pos: U32, +n: U32, out: Array<U32>, +cap: U32, +at: U32, last: Bool) -> Inf:
+  (a, v) = r
+  Inf{Br{a, (pos + 4 : U32), n, 0, 0}, inf_word(out, at, v), cap, (at + 4 : U32), last}
+
+def stored_word_at(br: Br, out: Array<U32>, +cap: U32, +at: U32, last: Bool) -> Inf:
+  match br:
+    case Br{a, pos, n, buf, cnt}:
+      +p = pos
+      stored_word(w4(a, p), p, n, out, cap, at, last)
+
+def stored_words(n: Nat, st: Inf) -> Inf:
+  match n, st:
+    case 0n, r:
+      r
+    case 1n+p, Inf{br, out, cap, pos, last}:
+      stored_words(p, stored_word_at(br, out, cap, pos, last))
+
+def stored_tail(st: Inf, +len: U32) -> Inf:
+  stored_copy(U32.to_nat((len .&. 3 : U32)), st)
+
 def stored_room(oc: Array<U32> & U32, br: Br, +pos: U32, +len: U32, last: Bool) -> Inf:
   (out, cap) = oc
-  stored_copy(U32.to_nat(len), Inf{br, out, cap, pos, last})
+  stored_tail(stored_words(U32.to_nat((len >> 2n : U32)), Inf{br, out, cap, pos, last}), len)
 
 def stored_nlen(r: Br & U32, out: Array<U32>, +cap: U32, +pos: U32, +len: U32, last: Bool) -> Inf:
   (br, nlen) = r
-  stored_room(room(out, cap, (pos + len : U32)), br, pos, len, last)
+  stored_room((out, cap), br, pos, len, last)
 
 def stored_len(r: Br & U32, out: Array<U32>, +cap: U32, +pos: U32, last: Bool) -> Inf:
   (br, len) = r
@@ -1075,7 +1239,11 @@ type Cp is Type:
 
 def copy_put(r: Array<U32> & U32, +pos: U32) -> Cp:
   (out, b) = r
-  Cp{Array.set(U32, out, pos, b)}
+  Cp{inf_put(out, pos, b)}
+
+def copy_word(r: Array<U32> & U32, +pos: U32) -> Cp:
+  (out, v) = r
+  Cp{inf_word(out, pos, v)}
 
 # n bytes from dist back, one at a time (an overlap repeats the run)
 def copy_loop(n: Nat, st: Cp, +pos: U32, +dist: U32) -> Cp:
@@ -1083,7 +1251,24 @@ def copy_loop(n: Nat, st: Cp, +pos: U32, +dist: U32) -> Cp:
     case 0n, r:
       r
     case 1n+p, Cp{out}:
-      copy_loop(p, copy_put(Array.get(U32, out, (pos - dist : U32)), pos), (pos + 1 : U32), dist)
+      copy_loop(p, copy_put(wb(out, (pos - dist : U32)), pos), (pos + 1 : U32), dist)
+
+def copy_words(n: Nat, st: Cp, +pos: U32, +dist: U32) -> Cp:
+  match n, st:
+    case 0n, r:
+      r
+    case 1n+p, Cp{out}:
+      copy_words(p, copy_word(w4(out, (pos - dist : U32)), pos), (pos + 4 : U32), dist)
+
+def copy_wide(+len: U32, out: Array<U32>, +pos: U32, +dist: U32) -> Cp:
+  copy_loop(U32.to_nat((len .&. 3 : U32)), copy_words(U32.to_nat((len >> 2n : U32)), Cp{out}, pos, dist), (pos + (len .&. 4294967292 : U32) : U32), dist)
+
+def copy_pick(+len: U32, out: Array<U32>, +pos: U32, +dist: U32, wide: Bool) -> Cp:
+  match wide:
+    case True{}:
+      copy_wide(len, out, pos, dist)
+    case False{}:
+      copy_loop(U32.to_nat(len), Cp{out}, pos, dist)
 
 def cp_out(st: Cp) -> Array<U32>:
   match st:
@@ -1092,10 +1277,10 @@ def cp_out(st: Cp) -> Array<U32>:
 
 def copy_room(oc: Array<U32> & U32, br: Br, lit: Huf, dst: Huf, +pos: U32, +len: U32, +dist: U32, last: Bool) -> Cd:
   (out, cap) = oc
-  Cd{Inf{br, cp_out(copy_loop(U32.to_nat(len), Cp{out}, pos, dist)), cap, (pos + len : U32), last}, Hs{lit, dst}, False{}}
+  Cd{Inf{br, cp_out(copy_pick(len, out, pos, dist, U32.is_ge(dist, 4) && U32.is_ge(len, 4))), cap, (pos + len : U32), last}, Hs{lit, dst}, False{}}
 
 def emit_copy(br: Br, lit: Huf, dst: Huf, out: Array<U32>, +cap: U32, +pos: U32, +len: U32, +dist: U32, last: Bool) -> Cd:
-  copy_room(room(out, cap, (pos + len : U32)), br, lit, dst, pos, len, dist, last)
+  copy_room((out, cap), br, lit, dst, pos, len, dist, last)
 
 def dist_fin(r: Br & U32, lit: Huf, dst: Huf, out: Array<U32>, +cap: U32, +pos: U32, +len: U32, +dbase: U32, last: Bool) -> Cd:
   (br, extra) = r
@@ -1118,13 +1303,13 @@ def len_sym(br: Br, lit: Huf, dst: Huf, out: Array<U32>, +cap: U32, +pos: U32, +
 
 def lit_put(oc: Array<U32> & U32, br: Br, lit: Huf, dst: Huf, +pos: U32, +sym: U32, last: Bool) -> Cd:
   (out, cap) = oc
-  Cd{Inf{br, Array.set(U32, out, pos, sym), cap, (pos + 1 : U32), last}, Hs{lit, dst}, False{}}
+  Cd{Inf{br, inf_put(out, pos, sym), cap, (pos + 1 : U32), last}, Hs{lit, dst}, False{}}
 
 # a literal below 256, the end of block at 256, a length above
 def sym_run(lit_: Bool, eob: Bool, br: Br, lit: Huf, dst: Huf, out: Array<U32>, +cap: U32, +pos: U32, +sym: U32, last: Bool) -> Cd:
   match lit_, eob:
     case True{}, k:
-      lit_put(room(out, cap, (pos + 1 : U32)), br, lit, dst, pos, sym, last)
+      lit_put((out, cap), br, lit, dst, pos, sym, last)
     case False{}, True{}:
       Cd{Inf{br, out, cap, pos, last}, Hs{lit, dst}, True{}}
     case False{}, False{}:
@@ -1341,49 +1526,16 @@ def blocks(n: Nat, st: Inf) -> Inf:
 # Gzip
 # ----
 # header: 1f 8b 08 FLG mtime(4) xfl os, then extra, name, comment and a
-# header crc as FLG says; the trailer (crc32, isize) is written, not read
-
-# the bytes [pos, n) inflated: the output packed with its size
-def pk_store(src: Array<U32>, dst: Array<U32>, +i: U32, +w: U32, full: Bool) -> Cw & U32:
-  match full:
-    case True{}:
-      (Cw{src, Array.set(U32, dst, (i >> 2n : U32), w)}, 0)
-    case False{}:
-      (Cw{src, dst}, w)
-
-def pk_put(r: Array<U32> & U32, dst: Array<U32>, +i: U32, +w: U32) -> Cw & U32:
-  (src, b) = r
-  pk_store(src, dst, i, (w .|. U32.shln(b, U32.to_nat(((i .&. 3) << 3n : U32))) : U32), U32.is_eq((i .&. 3 : U32), 3))
-
-def pk_loop(n: Nat, st: Cw & U32, +i: U32) -> Cw & U32:
-  match n, st:
-    case 0n, r:
-      r
-    case 1n+p, (Cw{src, dst}, w):
-      pk_loop(p, pk_put(Array.get(U32, src, i), dst, i, w), (i + 1 : U32))
-
-def pk_last(cw: Cw, +n: U32, +w: U32, partial: Bool) -> Array<U32> & U32:
-  match cw, partial:
-    case Cw{src, dst}, True{}:
-      (Array.set(U32, dst, (n >> 2n : U32), w), n)
-    case Cw{src, dst}, False{}:
-      (dst, n)
-
-def pk_fin(st: Cw & U32, +n: U32) -> Array<U32> & U32:
-  (cw, w) = st
-  pk_last(cw, n, w, U32.is_ne((n .&. 3 : U32), 0))
-
-def pack(src: Array<U32>, +n: U32) -> Array<U32> & U32:
-  pk_fin(pk_loop(U32.to_nat(n), (Cw{src, Array.new(U32, arr_depth(((n >> 2n) + 3 : U32)), 0)}, 0), 0), n)
+# header crc as FLG says; the final four trailer bytes are ISIZE.
 
 def inf_pack(st: Inf) -> Array<U32> & U32:
   match st:
     case Inf{br, out, cap, pos, last}:
-      pack(out, pos)
+      (out, pos)
 
-# the deflate stream from pos; the output starts at 64K and grows
-def inflate(a: Array<U32>, +pos: U32, +n: U32) -> Array<U32> & U32:
-  inf_pack(blocks(U32.to_nat(65536), Inf{Br{a, pos, n, 0, 0}, Array.new(U32, 16n, 0), 65536, 0, False{}}))
+# the deflate stream from pos; out_n is the gzip trailer's ISIZE
+def inflate(a: Array<U32>, +pos: U32, +n: U32, +out_n: U32) -> Array<U32> & U32:
+  inf_pack(blocks(U32.to_nat(65536), Inf{Br{a, pos, n, 0, 0}, Array.new(U32, arr_depth(((out_n >> 2n) + 3 : U32)), 0), out_n, 0, False{}}))
 
 # past a NUL-terminated field from pos
 type Sk is Type:
@@ -1448,12 +1600,16 @@ def gz_body(r: Array<U32> & U32, +n: U32) -> Array<U32> & U32:
   +f = flg
   skip_n(skip_nul(skip_nul(skip_extra((a, 10), U32.is_ne((f .&. 4 : U32), 0)), n, U32.is_ne((f .&. 8 : U32), 0)), n, U32.is_ne((f .&. 16 : U32), 0)), 2, U32.is_ne((f .&. 2 : U32), 0))
 
-def gz_start(r: Array<U32> & U32, +n: U32) -> Array<U32> & U32:
+def gz_start(r: Array<U32> & U32, +n: U32, +out_n: U32) -> Array<U32> & U32:
   (a, pos) = r
-  inflate(a, pos, n)
+  inflate(a, pos, n, out_n)
+
+def gz_sized(r: Array<U32> & U32, +n: U32) -> Array<U32> & U32:
+  (a, out_n) = r
+  gz_start(gz_body(wb(a, 3), n), n, out_n)
 
 def gunzip(a: Array<U32>, +n: U32) -> Array<U32> & U32:
-  gz_start(gz_body(wb(a, 3), n), n)
+  gz_sized(w4(a, (n - 4 : U32)), n)
 
 # the magic 1f 8b
 def gz_magic(r: Array<U32> & U32) -> Array<U32> & Bool:
@@ -1469,6 +1625,87 @@ def maybe_gunzip(a: Array<U32>, +n: U32, gz: Bool) -> Array<U32> & U32:
       gunzip(a, n)
     case False{}:
       (a, n)
+
+# Plain archives are listed one header at a time. Payload ranges are skipped by
+# advancing the pread offset, so a one-file 64 MiB archive reads 512 bytes rather
+# than materializing all 64 MiB. Gzip still uses the decoder above.
+type Ls is Type:
+  LRead{file: File, a: Array<U32>, n: U32, off: U32}
+  LHdr{file: File, h: Hdr, off: U32}
+
+def ls_read(r: Fr, +off: U32) -> Ls:
+  match r:
+    case Fr{file, a, n}:
+      LRead{file, a, n, off}
+
+def list_stream_close(st: Ls) -> IO(Unit):
+  match st:
+    case LRead{file, a, n, off}:
+      do IO<Unit>:
+        Unit <- drop_words(a)
+        File.close(file)
+    case LHdr{file, Hdr{a, name, size, kind, hoff, end}, off}:
+      do IO<Unit>:
+        Unit <- drop_words(a)
+        File.close(file)
+
+def list_stream_loop(fuel: Nat, st: Ls, +path: String, +n: U32) -> IO(Unit):
+  match fuel, st:
+    case 0n, r:
+      list_stream_close(r)
+    case 1n+p, LRead{file, a, got, off}:
+      +nn = got
+      list_stream_loop(p, LHdr{file, hdr_of(a, 0, nn), off}, path, n)
+    case 1n+p, LHdr{file, Hdr{a, name, size, kind, hoff, end}, off}:
+      match end:
+        case True{}:
+          do IO<Unit>:
+            Unit <- drop_words(a)
+            File.close(file)
+        case False{}:
+          +sz = size
+          +next = (off + 512 + sz + pad512(sz) : U32)
+          do IO<Unit>:
+            Unit <- IO.print(name)
+            Unit <- drop_words(a)
+            raw : File & Result<&1, &1, U32 & String, Array<U32> & U32> <- File.read_words_at(file, next, 512)
+            chunk : Fr <- file_read_words_got(path, raw)
+            list_stream_loop(p, ls_read(chunk, next), path, n)
+
+def walk_in_gzip(r: Array<U32> & U32) -> IO(Unit):
+  (a, n) = r
+  walk(gunzip(a, n), False{}, False{})
+
+def list_stream_peek(r: Array<U32> & Bool, file: File, +path: String, +n: U32, +got: U32) -> IO(Unit):
+  (a, magic) = r
+  match magic:
+    case False{}:
+      list_stream_loop(U32.to_nat((n / 256 + 4 : U32)), LHdr{file, hdr_of(a, 0, got), 0}, path, n)
+    case True{}:
+      do IO<Unit>:
+        Unit <- drop_words(a)
+        Unit <- File.close(file)
+        packed : Array<U32> & U32 <- read_words(path)
+        walk_in_gzip(packed)
+
+def list_stream_first(r: Fr, +path: String, +total: U32) -> IO(Unit):
+  match r:
+    case Fr{file, a, n}:
+      +nn = n
+      list_stream_peek(gz_peek(a), file, path, total, nn)
+
+def list_stream_open(file: File, +path: String, +n: U32) -> IO(Unit):
+  do IO<Unit>:
+    raw : File & Result<&1, &1, U32 & String, Array<U32> & U32> <- File.read_words_at(file, 0, 512)
+    chunk : Fr <- file_read_words_got(path, raw)
+    list_stream_first(chunk, path, n)
+
+def list_stream(+path: String) -> IO(Unit):
+  do IO<Unit>:
+    n : U32 <- size_of(path)
+    opened : Result<&1, &1, U32 & String, File> <- File.open(path, "r")
+    file : File <- open_got(path, opened)
+    list_stream_open(file, path, n)
 
 # Deflate
 # -------
@@ -1630,90 +1867,49 @@ def cf_slow(cf: Cf) -> Bool:
     case Cf{good, lazy, nice, chain, slow}:
       slow
 
-# the match length so far; more says the next bytes may extend it. A
-# step compares four bytes, and the first differing byte comes from the
-# xor's low zero bytes
-# A four-byte window advances by four bytes, so its old high word is its new
-# low word. Two read-only handles let the current and candidate streams cache
-# that overlap independently; each extension step then needs two reads total.
-type Ws is Type:
-  Ws{a: Array<U32>, q: U32, sh: U32, hi: U32}
+# Match extension keeps one linear input handle. The old implementation forked
+# that handle for every candidate and joined it afterwards. On repetitive data,
+# all workers then contended on the input array's atomic ownership metadata.
+# Serially reading the two four-byte windows costs two more word reads per step,
+# but leaves the shared input read-only and ownership-local to each chunk.
+type Mw is Type:
+  Mw{w: Array<U32>, a: U32, b: U32, len: U32, more: Bool}
 
-type Wv is Type:
-  Wv{ws: Ws, v: U32}
-
-def ws_value(+lo: U32, +hi: U32, +sh: U32) -> U32:
-  (U32.shrn(lo, U32.to_nat(sh)) .|. (U32.shln(hi, U32.to_nat((24 - sh : U32))) << 8n) : U32)
-
-def ws_init_hi(r: Array<U32> & U32, +q: U32, +sh: U32, +lo: U32) -> Wv:
-  (a, hi) = r
-  +hh = hi
-  Wv{Ws{a, q, sh, hh}, ws_value(lo, hh, sh)}
-
-def ws_init_lo(r: Array<U32> & U32, +q: U32, +sh: U32) -> Wv:
-  (a, lo) = r
-  ws_init_hi(Array.get(U32, a, (q + 1 : U32)), q, sh, lo)
-
-def ws_init(a: Array<U32>, +j: U32) -> Wv:
-  +q = (j >> 2n : U32)
-  +sh = ((j .&. 3) << 3n : U32)
-  ws_init_lo(Array.get(U32, a, q), q, sh)
-
-def ws_next_at(r: Array<U32> & U32, +q: U32, +sh: U32, +lo: U32) -> Wv:
-  (a, hi) = r
-  +hh = hi
-  Wv{Ws{a, (q + 1 : U32), sh, hh}, ws_value(lo, hh, sh)}
-
-def ws_next(st: Ws) -> Wv:
-  match st:
-    case Ws{a, q, sh, hi}:
-      +qq = q
-      +ss = sh
-      ws_next_at(Array.get(U32, a, (qq + 2 : U32)), qq, ss, hi)
-
-type Mw2 is Type:
-  Mw2{a: Ws, b: Ws, len: U32, more: Bool}
-
-def mw2_cmp(a: Ws, b: Ws, +wa: U32, +wb2: U32, +len: U32, +maxlen: U32) -> Mw2:
+def mw_cmp(r: Array<U32> & U32, +a: U32, +b: U32, +wa: U32, +len: U32, +maxlen: U32) -> Mw:
+  (w, wb2) = r
   +x = U32.xor(wa, wb2)
   +eq4 = U32.is_eq(x, 0)
   +len2 = (len + pick(eq4, 4, (b2u(U32.is_eq((x .&. 255 : U32), 0)) + b2u(U32.is_eq((x .&. 65535 : U32), 0)) + b2u(U32.is_eq((x .&. 16777215 : U32), 0)) : U32)) : U32)
-  Mw2{a, b, pick(U32.is_gt(len2, maxlen), maxlen, len2), eq4 && U32.is_lt(len2, maxlen)}
+  Mw{w, (a + 4 : U32), (b + 4 : U32), pick(U32.is_gt(len2, maxlen), maxlen, len2), eq4 && U32.is_lt(len2, maxlen)}
 
-def mw2_values(ra: Wv, rb: Wv, +len: U32, +maxlen: U32) -> Mw2:
-  match ra, rb:
-    case Wv{a, wa}, Wv{b, wb2}:
-      mw2_cmp(a, b, wa, wb2, len, maxlen)
+def mw_b(r: Array<U32> & U32, +a: U32, +b: U32, +len: U32, +maxlen: U32) -> Mw:
+  (w, wa) = r
+  mw_cmp(w4(w, b), a, b, wa, len, maxlen)
 
-def mw2_loop(fuel: Nat, st: Mw2, +maxlen: U32) -> Mw2:
+def mw_loop(fuel: Nat, st: Mw, +maxlen: U32) -> Mw:
   match fuel, st:
     case 0n, r:
       r
-    case 1n+p, Mw2{a, b, len, more}:
+    case 1n+p, Mw{w, a, b, len, more}:
       match more:
         case False{}:
-          Mw2{a, b, len, False{}}
+          Mw{w, a, b, len, False{}}
         case True{}:
-          +l = len
-          mw2_loop(p, mw2_values(ws_next(a), ws_next(b), l, maxlen), maxlen)
+          +aa = a
+          +bb = b
+          +ll = len
+          mw_loop(p, mw_b(w4(w, aa), aa, bb, ll, maxlen), maxlen)
 
-def mw2_start(ra: Wv, rb: Wv, +maxlen: U32) -> Mw2:
-  mw2_loop(64n, mw2_values(ra, rb, 0, maxlen), maxlen)
-
-def mw2_pair(arrays: Array<U32> & Array<U32>, +i: U32, +j: U32, +maxlen: U32) -> Mw2:
-  match arrays:
-    case (a, b):
-      mw2_start(ws_init(a, i), ws_init(b, j), maxlen)
-
-def mw2_fin(st: Mw2) -> Array<U32> & U32:
+def mw_fin(st: Mw) -> Array<U32> & U32:
   match st:
-    case Mw2{Ws{a, aq, ash, ahi}, Ws{b, bq, bsh, bhi}, len, more}:
-      (Array.join(U32, a, b), len)
+    case Mw{w, a, b, len, more}:
+      (w, len)
 
 def match_pick(w: Array<U32>, +i: U32, +dist: U32, +maxlen: U32, +x: U32, same: Bool) -> Array<U32> & U32:
   match same:
     case True{}:
-      mw2_fin(mw2_pair(Array.fork(U32, w), i, (i - dist : U32), maxlen))
+      +len = pick(U32.is_lt(maxlen, 4), maxlen, 4)
+      mw_fin(mw_loop(64n, Mw{w, (i + 4 : U32), (i - dist + 4 : U32), len, U32.is_gt(maxlen, 4)}, maxlen))
     case False{}:
       +len = (b2u(U32.is_eq((x .&. 255 : U32), 0)) + b2u(U32.is_eq((x .&. 65535 : U32), 0)) + b2u(U32.is_eq((x .&. 16777215 : U32), 0)) : U32)
       (w, pick(U32.is_gt(len, maxlen), maxlen, len))
@@ -3064,6 +3260,24 @@ def create_out(gz: Bool, verbose: Bool, +file: String, +level: U32, members: Lis
     case False{}:
       tar_stream(members, verbose, path_out(file), True{})
 
+def list_plain(+file: String, verbose: Bool, stream: Bool) -> IO(Unit):
+  match stream:
+    case True{}:
+      list_stream(path_in(file))
+    case False{}:
+      do IO<Unit>:
+        r : Array<U32> & U32 <- read_words(path_in(file))
+        walk_in(r, False{}, False{}, verbose)
+
+def list_in(gz: Bool, +file: String, verbose: Bool) -> IO(Unit):
+  match gz:
+    case True{}:
+      do IO<Unit>:
+        r : Array<U32> & U32 <- read_words(path_in(file))
+        walk_in(r, True{}, False{}, verbose)
+    case False{}:
+      list_plain(file, verbose, Bool.not(String.eq(file, "-")))
+
 def run_mode(create: Bool, extract: Bool, list: Bool, gz: Bool, verbose: Bool, +file: String, +level: U32, members: List<&2, String>) -> IO(Unit):
   match create, extract, list:
     case True{}, k1, k2:
@@ -3073,9 +3287,7 @@ def run_mode(create: Bool, extract: Bool, list: Bool, gz: Bool, verbose: Bool, +
         r : Array<U32> & U32 <- read_words(path_in(file))
         walk_in(r, gz, True{}, verbose)
     case False{}, False{}, True{}:
-      do IO<Unit>:
-        r : Array<U32> & U32 <- read_words(path_in(file))
-        walk_in(r, gz, False{}, verbose)
+      list_in(gz, file, verbose)
     case False{}, False{}, False{}:
       usage()
 

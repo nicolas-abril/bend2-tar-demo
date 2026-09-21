@@ -33,5 +33,12 @@ through one open file handle; they are not joined into a second whole-archive
 array. CRC-32 is a foreign packed-array primitive that uses ARM64 CRC
 instructions when available and a portable implementation elsewhere.
 
+Plain listing is streamed by reading one 512-byte header at a time from an
+open file and advancing past member payloads without reading them. Stdin keeps
+the sequential whole-input path because pipes cannot seek. Gzip inflate reads
+ISIZE up front, writes directly into packed output, copies stored data and
+backreferences four bytes at a time where possible, and uses a nine-bit primary
+Huffman table with a canonical fallback for longer codes.
+
 `make` builds `tar`; `make smoke` builds both, archives two files with each,
 compares the archives byte for byte, lists, extracts and compares the files.
