@@ -3063,6 +3063,7 @@ type Ck is Type:
 
 type Cq is Type:
   CLeaf{ck: Ck}
+  CPair{l: Ck, r: Ck}
   CNode{l: Cq, r: Cq}
 
 type Ot is Type:
@@ -3102,11 +3103,16 @@ def ck_run(ck: Ck, +cf: Cf) -> Ob:
     case Ck{a, start, n, d, last}:
       ck_run_at(a, start, n, d, last, cf)
 
-# the fork: siblings own their chunks
+# Bottom pairs fork ck_run directly. That gives the compiler a fork-free task
+# to leave for the saturated work phase instead of compressing a leaf while
+# the recursive par_tree task is still growing the frontier.
 def par_tree(t: Cq, +cf: Cf) -> Ot:
   match t:
     case CLeaf{ck}:
       OLeaf{ck_run(ck, cf)}
+    case CPair{l, r}:
+      a b = ck_run(l, cf) ck_run(r, cf)
+      ONode{OLeaf{a}, OLeaf{b}}
     case CNode{l, r}:
       a b = par_tree(l, cf) par_tree(r, cf)
       ONode{a, b}
@@ -3125,6 +3131,13 @@ def lv_list(st: Lv) -> List<&1, Cq>:
       acc
 
 # neighbours paired up, until one tree is left
+def pair_node(a: Cq, b: Cq) -> Cq:
+  match a, b:
+    case CLeaf{x}, CLeaf{y}:
+      CPair{x, y}
+    case x, y:
+      CNode{x, y}
+
 def pair_up(l: List<&1, Cq>) -> List<&1, Cq>:
   match l:
     case Nil{}:
@@ -3132,7 +3145,7 @@ def pair_up(l: List<&1, Cq>) -> List<&1, Cq>:
     case Con{a, Nil{}}:
       [a]
     case Con{a, Con{b, t}}:
-      CNode{a, b} <> pair_up(t)
+      pair_node(a, b) <> pair_up(t)
 
 def pair_loop(fuel: Nat, l: List<&1, Cq>, +count: U32, single: Bool) -> List<&1, Cq>:
   match fuel, single:
