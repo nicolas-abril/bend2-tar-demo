@@ -27,9 +27,14 @@ line and directory entries are skipped.
 Plain creation is streamed: Bend constructs each ustar header, then the sink
 effect writes that header, copies the member, and adds its padding in order.
 Member contents are never copied into a whole-archive array. Gzip creation
-builds the logical tar stream in bounded batches of up to sixty-three 256 KiB
-chunks. It carries the preceding 32 KiB dictionary into each batch, compresses
-the chunks in parallel, and writes the batch before producing the next one.
+builds the logical tar stream in bounded batches of 256 KiB chunks. A temporary
+user-defined runtime effect reads the effective native worker count
+(`--threads`, or its detected default; one in JavaScript), and sizes each batch
+to sixteen chunks per worker up to sixty-three. It carries the preceding 32 KiB
+dictionary into each batch, compresses the chunks in parallel, and writes the
+batch before producing the next one. This effect can be removed when Bend
+provides the public API requested in
+[bendlang/bend#971](https://github.com/bendlang/bend/issues/971).
 CRC-32 is updated incrementally by a foreign packed-array primitive that uses
 ARM64 CRC instructions when available and a portable implementation elsewhere.
 

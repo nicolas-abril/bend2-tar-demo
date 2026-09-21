@@ -328,6 +328,13 @@ def file_size(path: String) -> IO(Result<&1, &1, U32 & String, U32>):
   import "./effs/file_size.c"
   import "./effs/file_size.js"
 
+# Temporary user-defined FFI until Bend exposes this through Base. The native
+# implementation reports the effective pool selected by --threads (or the
+# detected default); generated JavaScript reports its single execution thread.
+def runtime_threads() -> IO(U32):
+  import "./effs/runtime_threads.c"
+  import "./effs/runtime_threads.js"
+
 def stream_append(path: String, a: Array<U32>, +header_n: U32, input: String, +pad_n: U32, +first: U32) -> IO(Array<U32> & Result<&1, &1, U32 & String, Unit>):
   import "./effs/stream_append.c"
   import "./effs/stream_append.js"
@@ -3186,12 +3193,27 @@ def deflate_batch(w: Array<U32>, +dict: U32, +n: U32, +level: U32, final: Bool) 
 type Gc is Type:
   Gc{src: Array<U32>, next: Ob}
 
-def batch_carry_pair(r: Array<U32> & Array<U32>) -> Gc:
+def batch_carry_pair(r: Array<U32> & Array<U32>, +cap: U32) -> Gc:
   (src, dst) = r
-  Gc{src, Ob{dst, 4194304, 32768}}
+  Gc{src, Ob{dst, cap, 32768}}
 
-def batch_new() -> Ob:
-  Ob{Array.new(U32, 22n, 0), 4194304, 0}
+# Sixteen chunks per worker amortize the current wave's setup and ordered-write
+# barriers; fewer lost 11-12% at four workers in the mixed corpus. The result
+# stays under the proven sixty-three-chunk ceiling. Subtracting one leaves room
+# for the carried 32 KiB dictionary in a power-of-two packed Array.
+def batch_chunk_budget(+workers: U32) -> U32:
+  +w = pick(U32.is_eq(workers, 0), 1, workers)
+  +want = (w * 16 - 1 : U32)
+  pick(U32.is_gt(want, 63), 63, want)
+
+def batch_depth(+chunks: U32) -> U32:
+  fit(31n, 0, (((32768 + chunks * 262144 : U32) + 3 : U32) / 4 + 3 : U32), False{})
+
+def batch_cap(+depth: U32) -> U32:
+  U32.shln(1, U32.to_nat(depth))
+
+def batch_new(+depth: U32, +cap: U32) -> Ob:
+  Ob{Array.new(U32, U32.to_nat(depth), 0), cap, 0}
 
 # XFL says 2 for the slowest level and 4 for the fastest
 def gz_head(ob: Ob, +level: U32) -> Ob:
@@ -3246,22 +3268,22 @@ def gzip_batch_stop(st: Gst) -> IO(Unit):
         Unit <- File.close(file)
         IO.die(Unit, 1, "tar: gzip batch limit")
 
-def gzip_batches(fuel: Nat, st: Gst, +level: U32, +path: String) -> IO(Unit):
+def gzip_batches(fuel: Nat, st: Gst, +level: U32, +path: String, +depth: U32, +batch_words: U32, +payload: U32) -> IO(Unit):
   match fuel, st:
     case 0n, r:
       gzip_batch_stop(r)
     case 1n+p, GFill{src, ob, dict, file, crc, total}:
       +dd = dict
       do IO<Unit>:
-        built : Bt <- tar_batch_fill(256n, True{}, src, ob, (dd + 16515072 : U32))
-        gzip_batches(p, GHave{built, dd, file, crc, total}, level, path)
+        built : Bt <- tar_batch_fill(256n, True{}, src, ob, (dd + payload : U32))
+        gzip_batches(p, GHave{built, dd, file, crc, total}, level, path, depth, batch_words, payload)
     case 1n+p, GHave{Bt{src, Ob{a, cap, pos}, done}, dict, file, crc, total}:
       +dd = dict
       +pp = pos
       +nn = (pp - dd : U32)
       do IO<Unit>:
         checked : Array<U32> & U32 <- crc_words_update(path, a, dd, nn, crc)
-        gzip_batches(p, GChecked{src, checked, dd, nn, pp, file, total, done}, level, path)
+        gzip_batches(p, GChecked{src, checked, dd, nn, pp, file, total, done}, level, path, depth, batch_words, payload)
     case 1n+p, GChecked{src, (a, crc), dict, n, pos, file, total, True{}}:
       +dd = dict
       +nn = n
@@ -3278,21 +3300,26 @@ def gzip_batches(fuel: Nat, st: Gst, +level: U32, +path: String) -> IO(Unit):
       +cc = crc
       +tt = (total + nn : U32)
       do IO<Unit>:
-        carried : Array<U32> & Array<U32> <- words_copy_range(a, (pp - 32768 : U32), Array.new(U32, 22n, 0), 0, 32768)
-        gzip_batches(p, GCarry{src, batch_carry_pair(carried), dd, nn, file, cc, tt}, level, path)
+        carried : Array<U32> & Array<U32> <- words_copy_range(a, (pp - 32768 : U32), Array.new(U32, U32.to_nat(depth), 0), 0, 32768)
+        gzip_batches(p, GCarry{src, batch_carry_pair(carried, batch_words), dd, nn, file, cc, tt}, level, path, depth, batch_words, payload)
     case 1n+p, GCarry{src, Gc{a, next}, dict, n, file, crc, total}:
       +dd = dict
       +nn = n
       do IO<Unit>:
         tail : File <- stream_parts(parts_list(deflate_batch(a, dd, nn, level, False{}), []), path, file)
-        gzip_batches(p, GFill{src, next, 32768, tail, crc, total}, level, path)
+        gzip_batches(p, GFill{src, next, 32768, tail, crc, total}, level, path, depth, batch_words, payload)
 
 def gzip_bounded(+path: String, names: List<&2, String>, +verbose: Bool, +level: U32) -> IO(Unit):
   do IO<Unit>:
+    thread_count : U32 <- runtime_threads()
+    +chunks : U32 = batch_chunk_budget(thread_count)
+    +depth : U32 = batch_depth(chunks)
+    +cap : U32 = batch_cap(depth)
+    +payload : U32 = (chunks * 262144 : U32)
     members : List<&1, Tm> <- tar_manifest(names, verbose)
     file : File <- open_out(path)
     body : File <- file_write_ob(path, file, gz_head(ob_new(), level))
-    gzip_batches(U32.to_nat(4096), GFill{GFiles{members}, batch_new(), 0, body, 0, 0}, level, path)
+    gzip_batches(U32.to_nat(4096), GFill{GFiles{members}, batch_new(depth, cap), 0, body, 0, 0}, level, path, depth, cap, payload)
 
 # Command line
 # ------------
