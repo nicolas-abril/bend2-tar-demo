@@ -22,21 +22,21 @@ Flags: `c` create, `x` extract, `t` list, `f FILE` (`-` for stdin/stdout),
 `z` gzip, `v` verbose, `0`-`9` the gzip level (6 by default). Bytes ride
 packed word arrays through the foreign effects under `effs/`. There is
 no mkdir or readdir, so an archive holds the files named on the command
-line and directory entries are skipped.
+line and directory entries are skipped. The `TAR_ARGS` parser accepts up to
+4096 words and stops as soon as the environment string ends.
 
 Plain creation is streamed: Bend constructs each ustar header, then the sink
 effect writes that header, copies the member, and adds its padding in order.
 Member contents are never copied into a whole-archive array. Gzip creation
 builds the logical tar stream in bounded batches. A temporary user-defined
 runtime effect reads the effective native worker count (`--threads`, or its
-detected default; one in JavaScript). Each worker task owns at most 992 KiB and
-compresses it as eight adjacent 124 KiB DEFLATE streams, retaining its matcher
-tables between streams. Incompressible streams therefore fit in their initial
-128 KiB output Arrays. The task count follows the worker count (rounded up for
-an odd pool and capped at sixty-two), so an eight-worker batch remains near
-8 MiB while every worker receives a long-lived task. Bend writes a completed
-batch before allocating and producing the next one and carries only the
-preceding 32 KiB dictionary between batches. This effect can be removed when Bend
+detected default; one in JavaScript). Each compression task owns at most
+248 KiB, so incompressible output fits in its initial 256 KiB Array. The task
+count is four times the worker count (capped at sixty), keeping an eight-worker
+batch near 8 MiB while leaving enough independent work to balance uneven files
+and heterogeneous cores. Bend writes a completed batch before allocating and
+producing the next one and carries only the preceding 32 KiB dictionary between
+batches. This effect can be removed when Bend
 provides the public API requested in
 [bendlang/bend#971](https://github.com/bendlang/bend/issues/971).
 CRC-32 is updated incrementally by a foreign packed-array primitive that uses
