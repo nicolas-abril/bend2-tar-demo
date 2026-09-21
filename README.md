@@ -39,6 +39,8 @@ producing the next one and carries only the preceding 32 KiB dictionary between
 batches. This effect can be removed when Bend
 provides the public API requested in
 [bendlang/bend#971](https://github.com/bendlang/bend/issues/971).
+The LZ77 chain walk keeps the current four-byte window across candidates, so a
+full candidate comparison reads only the candidate window from the input Array.
 CRC-32 is updated incrementally by a foreign packed-array primitive that uses
 ARM64 CRC instructions when available and a portable implementation elsewhere.
 
