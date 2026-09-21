@@ -3049,7 +3049,9 @@ def bk_bw(st: Bk) -> Bw:
 
 # Chunks
 # ------
-# the input in chunks of 262144 bytes. Array.fork gives every chunk a
+# the input in chunks of 519168 bytes. The 5 KiB margin keeps an
+# incompressible chunk plus DEFLATE framing inside a 512 KiB output Array.
+# Array.fork gives every chunk a
 # read-only handle to the same block in O(1); the 32768 bytes before its
 # start are the dictionary the tables see first. A chunk's
 # stream ends byte aligned with an empty stored block unless it is the
@@ -3155,23 +3157,23 @@ def tree_head(l: List<&1, Cq>) -> Cq:
     case Con{h, t}:
       tree_only(t, h)
 
-# A bounded batch starts with dict bytes carried from the preceding batch,
-# followed by up to sixty-three normal 256 KiB chunks. Sixty-three keeps the
-# complete input, including the dictionary and spare words, inside a
-# 2^22-word Array while giving the scheduler ample work to balance eight CPUs.
+# A bounded batch starts with dictionary bytes carried from the preceding
+# batch, followed by two 507 KiB chunks per worker. At eight workers the input
+# and worst-case output each stay near 8 MiB while the scheduler has two jobs
+# per CPU for load balancing.
 def batch_lv_loop(m: Nat, st: Lv, +k: U32, +count: U32, +dict: U32, +n: U32, +final: Bool) -> Lv:
   match m, st:
     case 0n, r:
       r
     case 1n+p, Lv{w, acc}:
-      +s = (dict + k * 262144 : U32)
-      +left = (n - k * 262144 : U32)
-      +e = (s + pick(U32.is_lt(left, 262144), left, 262144) : U32)
+      +s = (dict + k * 519168 : U32)
+      +left = (n - k * 519168 : U32)
+      +e = (s + pick(U32.is_lt(left, 519168), left, 519168) : U32)
       +d = pick(U32.is_lt(s, 32768), s, 32768)
       batch_lv_loop(p, lv_add(Array.fork(U32, w), acc, s, e, d, final && U32.is_eq((k + 1 : U32), count)), (k - 1 : U32), count, dict, n, final)
 
 def batch_chunks(w: Array<U32>, +dict: U32, +n: U32, final: Bool) -> Cq:
-  +count = pick(U32.is_eq(n, 0), 1, ((n + 262143) / 262144 : U32))
+  +count = pick(U32.is_eq(n, 0), 1, ((n + 519167) / 519168 : U32))
   tree_head(pair_loop(32n, lv_list(batch_lv_loop(U32.to_nat(count), Lv{w, []}, (count - 1 : U32), count, dict, n, final)), count, U32.is_eq(count, 1)))
 
 # A compressed leaf already ends on a byte boundary. Keep the leaves separate
@@ -3191,23 +3193,27 @@ def deflate_batch(w: Array<U32>, +dict: U32, +n: U32, +level: U32, final: Bool) 
   deflate_batch_go(w, dict, n, level, final, U32.is_eq(level, 0))
 
 type Gc is Type:
-  Gc{src: Array<U32>, next: Ob}
+  Gc{src: Array<U32>, dict: Array<U32>}
 
-def batch_carry_pair(r: Array<U32> & Array<U32>, +cap: U32) -> Gc:
+def batch_carry_pair(r: Array<U32> & Array<U32>) -> Gc:
   (src, dst) = r
-  Gc{src, Ob{dst, cap, 32768}}
+  Gc{src, dst}
 
-# Sixteen chunks per worker amortize the current wave's setup and ordered-write
-# barriers; fewer lost 11-12% at four workers in the mixed corpus. The result
-# stays under the proven sixty-three-chunk ceiling. Subtracting one leaves room
-# for the carried 32 KiB dictionary in a power-of-two packed Array.
+def batch_seed_pair(r: Array<U32> & Array<U32>, +cap: U32) -> IO(Ob):
+  (dict, dst) = r
+  do IO<Ob>:
+    Unit <- drop_words(dict)
+    return Ob{dst, cap, 32768}
+
+# Two larger chunks per worker keep the current wave bounded while giving each
+# worker enough sequential compression to amortize setup and ordered writes.
 def batch_chunk_budget(+workers: U32) -> U32:
   +w = pick(U32.is_eq(workers, 0), 1, workers)
-  +want = (w * 16 - 1 : U32)
+  +want = (w * 2 : U32)
   pick(U32.is_gt(want, 63), 63, want)
 
 def batch_depth(+chunks: U32) -> U32:
-  fit(31n, 0, (((32768 + chunks * 262144 : U32) + 3 : U32) / 4 + 3 : U32), False{})
+  fit(31n, 0, (((32768 + chunks * 519168 : U32) + 3 : U32) / 4 + 3 : U32), False{})
 
 def batch_cap(+depth: U32) -> U32:
   U32.shln(1, U32.to_nat(depth))
@@ -3261,7 +3267,7 @@ def gzip_batch_stop(st: Gst) -> IO(Unit):
         Unit <- drop_words(a)
         Unit <- File.close(file)
         IO.die(Unit, 1, "tar: gzip batch limit")
-    case GCarry{src, Gc{a, Ob{b, cap, pos}}, dict, n, file, crc, total}:
+    case GCarry{src, Gc{a, b}, dict, n, file, crc, total}:
       do IO<Unit>:
         Unit <- drop_words(a)
         Unit <- drop_words(b)
@@ -3300,13 +3306,15 @@ def gzip_batches(fuel: Nat, st: Gst, +level: U32, +path: String, +depth: U32, +b
       +cc = crc
       +tt = (total + nn : U32)
       do IO<Unit>:
-        carried : Array<U32> & Array<U32> <- words_copy_range(a, (pp - 32768 : U32), Array.new(U32, U32.to_nat(depth), 0), 0, 32768)
-        gzip_batches(p, GCarry{src, batch_carry_pair(carried, batch_words), dd, nn, file, cc, tt}, level, path, depth, batch_words, payload)
-    case 1n+p, GCarry{src, Gc{a, next}, dict, n, file, crc, total}:
+        carried : Array<U32> & Array<U32> <- words_copy_range(a, (pp - 32768 : U32), Array.new(U32, 13n, 0), 0, 32768)
+        gzip_batches(p, GCarry{src, batch_carry_pair(carried), dd, nn, file, cc, tt}, level, path, depth, batch_words, payload)
+    case 1n+p, GCarry{src, Gc{a, dict_words}, dict, n, file, crc, total}:
       +dd = dict
       +nn = n
       do IO<Unit>:
         tail : File <- stream_parts(parts_list(deflate_batch(a, dd, nn, level, False{}), []), path, file)
+        seeded : Array<U32> & Array<U32> <- words_copy_range(dict_words, 0, Array.new(U32, U32.to_nat(depth), 0), 0, 32768)
+        next : Ob <- batch_seed_pair(seeded, batch_words)
         gzip_batches(p, GFill{src, next, 32768, tail, crc, total}, level, path, depth, batch_words, payload)
 
 def gzip_bounded(+path: String, names: List<&2, String>, +verbose: Bool, +level: U32) -> IO(Unit):
@@ -3315,7 +3323,7 @@ def gzip_bounded(+path: String, names: List<&2, String>, +verbose: Bool, +level:
     +chunks : U32 = batch_chunk_budget(thread_count)
     +depth : U32 = batch_depth(chunks)
     +cap : U32 = batch_cap(depth)
-    +payload : U32 = (chunks * 262144 : U32)
+    +payload : U32 = (chunks * 519168 : U32)
     members : List<&1, Tm> <- tar_manifest(names, verbose)
     file : File <- open_out(path)
     body : File <- file_write_ob(path, file, gz_head(ob_new(), level))
