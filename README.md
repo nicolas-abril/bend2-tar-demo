@@ -28,7 +28,10 @@ Plain creation is streamed: Bend constructs each ustar header, then the sink
 effect writes that header, copies the member, and adds its padding in order.
 Member contents are never copied into a whole-archive array. Gzip creation
 reads members directly into their final packed ranges, then uses the parallel
-Bend DEFLATE implementation and its packed chunk arrays.
+Bend DEFLATE implementation. Completed compressed chunks are written in order
+through one open file handle; they are not joined into a second whole-archive
+array. CRC-32 is a foreign packed-array primitive that uses ARM64 CRC
+instructions when available and a portable implementation elsewhere.
 
 `make` builds `tar`; `make smoke` builds both, archives two files with each,
 compares the archives byte for byte, lists, extracts and compares the files.

@@ -332,6 +332,18 @@ def stream_append(path: String, a: Array<U32>, +header_n: U32, input: String, +p
   import "./effs/stream_append.c"
   import "./effs/stream_append.js"
 
+def words_crc32(a: Array<U32>, +start: U32, +n: U32) -> IO(Array<U32> & Result<&1, &1, U32 & String, U32>):
+  import "./effs/words_crc32.c"
+  import "./effs/words_crc32.js"
+
+def File.write_words(file: File, a: Array<U32>, +start: U32, +n: U32) -> IO(File & Array<U32> & Result<&1, &1, U32 & String, Unit>):
+  import "./effs/file_words_write.c"
+  import "./effs/file_words_write.js"
+
+def output_open(path: String) -> IO(Result<&1, &1, U32 & String, File>):
+  import "./effs/output_open.c"
+  import "./effs/output_open.js"
+
 def io_fail(what: String, e: U32 & String) -> IO(Unit):
   (code, msg) = e
   IO.die(Unit, 1, "tar: " ++ what ++ ": " ++ msg)
@@ -388,6 +400,50 @@ def fill_words(+path: String, a: Array<U32>, +start: U32, +n: U32) -> IO(Array<U
 def drop_words(a: Array<U32>) -> IO(Unit):
   IO.pure(Unit, Unit{})
 
+def crc_got(what: String, r: Array<U32> & Result<&1, &1, U32 & String, U32>) -> IO(Array<U32> & U32):
+  (a, v) = r
+  match v:
+    case Done{v}:
+      IO.pure(Array<U32> & U32, (a, v))
+    case Fail{e}:
+      do IO<Array<U32> & U32>:
+        Unit <- drop_words(a)
+        Unit <- io_fail(what, e)
+        IO.die(Array<U32> & U32, 1, "unreachable")
+
+def crc_words(+what: String, a: Array<U32>, +n: U32) -> IO(Array<U32> & U32):
+  do IO<Array<U32> & U32>:
+    r : Array<U32> & Result<&1, &1, U32 & String, U32> <- words_crc32(a, 0, n)
+    crc_got(what, r)
+
+def open_got(what: String, r: Result<&1, &1, U32 & String, File>) -> IO(File):
+  match r:
+    case Done{file}:
+      IO.pure(File, file)
+    case Fail{e}:
+      do IO<File>:
+        Unit <- io_fail(what, e)
+        IO.die(File, 1, "unreachable")
+
+def open_out(+path: String) -> IO(File):
+  do IO<File>:
+    r : Result<&1, &1, U32 & String, File> <- output_open(path)
+    open_got(path, r)
+
+def file_words_got(what: String, r: File & Array<U32> & Result<&1, &1, U32 & String, Unit>) -> IO(File):
+  (file, a, v) = r
+  match v:
+    case Done{u}:
+      do IO<File>:
+        Unit <- drop_words(a)
+        return file
+    case Fail{e}:
+      do IO<File>:
+        Unit <- drop_words(a)
+        Unit <- File.close(file)
+        Unit <- io_fail(what, e)
+        IO.die(File, 1, "unreachable")
+
 def append_words(+path: String, a: Array<U32>, +header_n: U32, +input: String, +pad_n: U32, first: Bool) -> IO(Unit):
   do IO<Unit>:
     r : Array<U32> & Result<&1, &1, U32 & String, Unit> <- stream_append(path, a, header_n, input, pad_n, b2u(first))
@@ -422,6 +478,13 @@ def say(verbose: Bool, line: String) -> IO(Unit):
 
 type Ob is Type:
   Ob{a: Array<U32>, cap: U32, pos: U32}
+
+def file_write_ob(+path: String, file: File, st: Ob) -> IO(File):
+  match st:
+    case Ob{a, cap, pos}:
+      do IO<File>:
+        r : File & Array<U32> & Result<&1, &1, U32 & String, Unit> <- File.write_words(file, a, 0, pos)
+        file_words_got(path, r)
 
 def ob_new() -> Ob:
   Ob{Array.new(U32, 16n, 0), 65536, 0}
@@ -501,13 +564,6 @@ def ob_zero(st: Ob, +n: U32) -> Ob:
 # words of src copied to a word-aligned pos
 type Cw is Type:
   Cw{src: Array<U32>, dst: Array<U32>}
-
-def ob_write(+path: String, st: Ob) -> IO(Unit):
-  match st:
-    case Ob{a, cap, pos}:
-      do IO<Unit>:
-        a2 : Array<U32> <- write_words(path, a, 0, pos)
-        drop_words(a2)
 
 # Tar
 # ---
@@ -709,216 +765,6 @@ def walk(r: Array<U32> & U32, extract: Bool, verbose: Bool) -> IO(Unit):
   (a, n) = r
   +nn = n
   tar_walk(U32.to_nat((nn / 512 + 1 : U32)), hdr_of(a, 0, nn), nn, extract, verbose)
-
-# CRC-32
-# ------
-
-def crc_entry(n: Nat, +c: U32) -> U32:
-  match n:
-    case 0n:
-      c
-    case 1n+p:
-      crc_entry(p, U32.xor((c >> 1n : U32), ((c .&. 1) * 3988292384 : U32)))
-
-def crc_table(n: Nat, +i: U32, t: Array<U32>) -> Array<U32>:
-  match n:
-    case 0n:
-      t
-    case 1n+p:
-      crc_table(p, (i + 1 : U32), Array.set(U32, t, i, crc_entry(8n, i)))
-
-def crc_slice_put(r: Array<U32> & U32, +c: U32, +i: U32, +dst: U32) -> Array<U32>:
-  (t, e) = r
-  Array.set(U32, t, (dst + i : U32), U32.xor(e, (c >> 8n : U32)))
-
-def crc_slice_at(r: Array<U32> & U32, +i: U32, +dst: U32) -> Array<U32>:
-  (t, c) = r
-  +cc = c
-  crc_slice_put(Array.get(U32, t, (cc .&. 255 : U32)), cc, i, dst)
-
-def crc_slice(n: Nat, +i: U32, +src: U32, +dst: U32, t: Array<U32>) -> Array<U32>:
-  match n:
-    case 0n:
-      t
-    case 1n+p:
-      crc_slice(p, (i + 1 : U32), src, dst, crc_slice_at(Array.get(U32, t, (src + i : U32)), i, dst))
-
-def crc_tables() -> Array<U32>:
-  crc_slice(256n, 0, 1536, 1792,
-    crc_slice(256n, 0, 1280, 1536,
-      crc_slice(256n, 0, 1024, 1280,
-        crc_slice(256n, 0, 768, 1024,
-          crc_slice(256n, 0, 512, 768,
-            crc_slice(256n, 0, 256, 512,
-              crc_slice(256n, 0, 0, 256,
-                crc_table(256n, 0, Array.new(U32, 11n, 0)))))))))
-
-type Ca is Type:
-  Ca{w: Array<U32>, t: Array<U32>, c: U32}
-
-def cb(r: Array<U32> & U32, +c: U32) -> Array<U32> & U32:
-  (t, e) = r
-  (t, U32.xor(e, (c >> 8n : U32)))
-
-def cb_at(t: Array<U32>, +c: U32, +b: U32) -> Array<U32> & U32:
-  cb(Array.get(U32, t, (U32.xor(c, b) .&. 255 : U32)), c)
-
-# k bytes of v through the table, low byte first
-def cw(k: Nat, r: Array<U32> & U32, +v: U32) -> Array<U32> & U32:
-  match k, r:
-    case 0n, p:
-      p
-    case 1n+p2, (t, c):
-      cw(p2, cb_at(t, c, (v .&. 255 : U32)), (v >> 8n : U32))
-
-def ca_of(r: Array<U32> & U32, w: Array<U32>) -> Ca:
-  (t, c) = r
-  Ca{w, t, c}
-
-def ca_step(r: Array<U32> & U32, t: Array<U32>, +c: U32, k: Nat) -> Ca:
-  (w, v) = r
-  ca_of(cw(k, (t, c), v), w)
-
-# Four slicing tables consume a complete word without the recursive byte
-# loop. T3 handles the low byte after crc xor word, down to T0 for the high.
-def ca4_0(r: Array<U32> & U32, w: Array<U32>, +a: U32, +b: U32, +c: U32) -> Ca:
-  (t, d) = r
-  Ca{w, t, U32.xor(U32.xor(a, b), U32.xor(c, d))}
-
-def ca4_1(r: Array<U32> & U32, w: Array<U32>, +x: U32, +a: U32, +b: U32) -> Ca:
-  (t, c) = r
-  ca4_0(Array.get(U32, t, ((x >> 24n) .&. 255 : U32)), w, a, b, c)
-
-def ca4_2(r: Array<U32> & U32, w: Array<U32>, +x: U32, +a: U32) -> Ca:
-  (t, b) = r
-  ca4_1(Array.get(U32, t, (256 + ((x >> 16n) .&. 255 : U32) : U32)), w, x, a, b)
-
-def ca4_3(r: Array<U32> & U32, w: Array<U32>, +x: U32) -> Ca:
-  (t, a) = r
-  ca4_2(Array.get(U32, t, (512 + ((x >> 8n) .&. 255 : U32) : U32)), w, x, a)
-
-def ca4_step(r: Array<U32> & U32, t: Array<U32>, +c: U32) -> Ca:
-  (w, v) = r
-  +x = U32.xor(c, v)
-  ca4_3(Array.get(U32, t, (768 + (x .&. 255 : U32) : U32)), w, x)
-
-# Slicing-by-8 consumes two packed words per iteration.
-def ca8_0(r: Array<U32> & U32, w: Array<U32>, +acc: U32) -> Ca:
-  (t, x) = r
-  Ca{w, t, U32.xor(acc, x)}
-
-def ca8_1(r: Array<U32> & U32, w: Array<U32>, +hi: U32, +acc: U32) -> Ca:
-  (t, x) = r
-  ca8_0(Array.get(U32, t, ((hi >> 24n) .&. 255 : U32)), w, U32.xor(acc, x))
-
-def ca8_2(r: Array<U32> & U32, w: Array<U32>, +hi: U32, +acc: U32) -> Ca:
-  (t, x) = r
-  ca8_1(Array.get(U32, t, (256 + ((hi >> 16n) .&. 255 : U32) : U32)), w, hi, U32.xor(acc, x))
-
-def ca8_3(r: Array<U32> & U32, w: Array<U32>, +hi: U32, +acc: U32) -> Ca:
-  (t, x) = r
-  ca8_2(Array.get(U32, t, (512 + ((hi >> 8n) .&. 255 : U32) : U32)), w, hi, U32.xor(acc, x))
-
-def ca8_4(r: Array<U32> & U32, w: Array<U32>, +hi: U32, +acc: U32) -> Ca:
-  (t, x) = r
-  ca8_3(Array.get(U32, t, (768 + (hi .&. 255 : U32) : U32)), w, hi, U32.xor(acc, x))
-
-def ca8_5(r: Array<U32> & U32, w: Array<U32>, +lo: U32, +hi: U32, +acc: U32) -> Ca:
-  (t, x) = r
-  ca8_4(Array.get(U32, t, (1024 + ((lo >> 24n) .&. 255 : U32) : U32)), w, hi, U32.xor(acc, x))
-
-def ca8_6(r: Array<U32> & U32, w: Array<U32>, +lo: U32, +hi: U32, +acc: U32) -> Ca:
-  (t, x) = r
-  ca8_5(Array.get(U32, t, (1280 + ((lo >> 16n) .&. 255 : U32) : U32)), w, lo, hi, U32.xor(acc, x))
-
-def ca8_7(r: Array<U32> & U32, w: Array<U32>, +lo: U32, +hi: U32, +acc: U32) -> Ca:
-  (t, x) = r
-  ca8_6(Array.get(U32, t, (1536 + ((lo >> 8n) .&. 255 : U32) : U32)), w, lo, hi, U32.xor(acc, x))
-
-def ca8_words(r: Array<U32> & U32, t: Array<U32>, +c: U32, +hi: U32) -> Ca:
-  (w, low) = r
-  +lo = U32.xor(c, low)
-  ca8_7(Array.get(U32, t, (1792 + (lo .&. 255 : U32) : U32)), w, lo, hi, 0)
-
-def ca8_step(r: Array<U32> & U32, t: Array<U32>, +c: U32, +q: U32) -> Ca:
-  (w, hi) = r
-  ca8_words(Array.get(U32, w, q), t, c, hi)
-
-def ca8_loop(n: Nat, st: Ca, +q: U32) -> Ca:
-  match n, st:
-    case 0n, r:
-      r
-    case 1n+p, Ca{w, t, c}:
-      ca8_loop(p, ca8_step(Array.get(U32, w, (q + 1 : U32)), t, c, q), (q + 2 : U32))
-
-def ca8_last(st: Ca, +q: U32, odd: Bool) -> Ca:
-  match st, odd:
-    case r, False{}:
-      r
-    case Ca{w, t, c}, True{}:
-      ca4_step(Array.get(U32, w, q), t, c)
-
-def ca8_all(+words: U32, st: Ca, +q: U32) -> Ca:
-  +even = (words .&. 4294967294 : U32)
-  ca8_last(ca8_loop(U32.to_nat((words >> 1n : U32)), st, q), (q + even : U32), U32.is_ne((words .&. 1 : U32), 0))
-
-# the full words, then the last n % 4 bytes
-def ca_tail(st: Ca, +n: U32) -> Ca:
-  match st:
-    case Ca{w, t, c}:
-      ca_step(w4(w, (n .&. 4294967292 : U32)), t, c, U32.to_nat((n .&. 3 : U32)))
-
-def ca_fin(st: Ca) -> Array<U32> & U32:
-  match st:
-    case Ca{w, t, c}:
-      (w, U32.xor(c, 4294967295))
-
-# the crc of the n bytes, with the words handed back
-def crc32(w: Array<U32>, +n: U32) -> Array<U32> & U32:
-  ca_fin(ca_tail(ca8_all((n >> 2n : U32), Ca{w, crc_tables(), 4294967295}, 0), n))
-
-# CRC concatenation
-# -----------------
-# CRC(a ++ b) from CRC(a), CRC(b) and |b|, with the reflected CRC-32
-# polynomial. Multiplication is in GF(2); exponentiating x^8 by the byte
-# count advances the first remainder across the second block.
-
-def mm_bit(+a: U32, +b: U32, +m: U32, +p: U32) -> U32:
-  U32.xor(p, pick(U32.is_zero((a .&. m : U32)), 0, b))
-
-def mm_next(+b: U32) -> U32:
-  U32.xor((b >> 1n : U32), pick(U32.is_zero((b .&. 1 : U32)), 0, 3988292384))
-
-def mm_loop(n: Nat, +a: U32, +b: U32, +m: U32, +p: U32) -> U32:
-  match n:
-    case 0n:
-      p
-    case 1n+k:
-      mm_loop(k, a, mm_next(b), (m >> 1n : U32), mm_bit(a, b, m, p))
-
-def multmodp(+a: U32, +b: U32) -> U32:
-  mm_loop(32n, a, b, 2147483648, 0)
-
-def x8_op() -> U32:
-  +x2 = multmodp(1073741824, 1073741824)
-  +x4 = multmodp(x2, x2)
-  multmodp(x4, x4)
-
-def xp_step(+base: U32, +acc: U32, bit: Bool) -> U32 & U32:
-  (multmodp(base, base), pick(bit, multmodp(base, acc), acc))
-
-def xp_loop(n: Nat, +bytes: U32, p: U32 & U32) -> U32:
-  match n, p:
-    case 0n, (base, acc):
-      acc
-    case 1n+k, (base, acc):
-      xp_loop(k, (bytes >> 1n : U32), xp_step(base, acc, U32.is_ne((bytes .&. 1 : U32), 0)))
-
-def crc_shift(+crc: U32, +bytes: U32) -> U32:
-  multmodp(xp_loop(32n, bytes, (x8_op(), 2147483648)), crc)
-
-def crc_combine(+left: U32, +right: U32, +right_n: U32) -> U32:
-  U32.xor(crc_shift(left, right_n), right)
 
 # Bit reader
 # ----------
@@ -2943,7 +2789,7 @@ def bk_bw(st: Bk) -> Bw:
 # and a parallel let forks over it.
 
 type Ck is Type:
-  Ck{a: Array<U32>, table: Array<U32>, start: U32, n: U32, d: U32, last: Bool}
+  Ck{a: Array<U32>, start: U32, n: U32, d: U32, last: Bool}
 
 type Cq is Type:
   CLeaf{ck: Ck}
@@ -2983,7 +2829,7 @@ def ck_run_at(a: Array<U32>, +start: U32, +n: U32, +d: U32, last: Bool, +cf: Cf)
 
 def ck_run(ck: Ck, +cf: Cf) -> Ob:
   match ck:
-    case Ck{a, table, start, n, d, last}:
+    case Ck{a, start, n, d, last}:
       ck_run_at(a, start, n, d, last, cf)
 
 # the fork: siblings own their chunks
@@ -2997,26 +2843,25 @@ def par_tree(t: Cq, +cf: Cf) -> Ot:
 
 # the chunks as leaves, built from the last down so the list runs in order
 type Lv is Type:
-  Lv{w: Array<U32>, table: Array<U32>, acc: List<&1, Cq>}
+  Lv{w: Array<U32>, acc: List<&1, Cq>}
 
-def lv_add(r: Array<U32> & Array<U32>, tables: Array<U32> & Array<U32>, acc: List<&1, Cq>, +start: U32, +n: U32, +d: U32, last: Bool) -> Lv:
+def lv_add(r: Array<U32> & Array<U32>, acc: List<&1, Cq>, +start: U32, +n: U32, +d: U32, last: Bool) -> Lv:
   (w, chunk) = r
-  (table, leaf_table) = tables
-  Lv{w, table, CLeaf{Ck{chunk, leaf_table, start, n, d, last}} <> acc}
+  Lv{w, CLeaf{Ck{chunk, start, n, d, last}} <> acc}
 
 def lv_loop(m: Nat, st: Lv, +k: U32, +count: U32, +n: U32) -> Lv:
   match m, st:
     case 0n, r:
       r
-    case 1n+p, Lv{w, table, acc}:
+    case 1n+p, Lv{w, acc}:
       +s = (k * 262144 : U32)
       +e = (s + pick(U32.is_lt((n - s : U32), 262144), (n - s : U32), 262144) : U32)
       +d = pick(U32.is_lt(s, 32768), s, 32768)
-      lv_loop(p, lv_add(Array.fork(U32, w), Array.fork(U32, table), acc, s, e, d, U32.is_eq((k + 1 : U32), count)), (k - 1 : U32), count, n)
+      lv_loop(p, lv_add(Array.fork(U32, w), acc, s, e, d, U32.is_eq((k + 1 : U32), count)), (k - 1 : U32), count, n)
 
 def lv_list(st: Lv) -> List<&1, Cq>:
   match st:
-    case Lv{w, table, acc}:
+    case Lv{w, acc}:
       acc
 
 # neighbours paired up, until one tree is left
@@ -3048,89 +2893,29 @@ def tree_only(t: List<&1, Cq>, h: Cq) -> Cq:
 def tree_head(l: List<&1, Cq>) -> Cq:
   match l:
     case Nil{}:
-      CLeaf{Ck{Array.new(U32, 4n, 0), crc_tables(), 0, 0, 0, True{}}}
+      CLeaf{Ck{Array.new(U32, 4n, 0), 0, 0, 0, True{}}}
     case Con{h, t}:
       tree_only(t, h)
 
 def chunks(w: Array<U32>, +n: U32) -> Cq:
   +count = pick(U32.is_eq(n, 0), 1, ((n + 262143) / 262144 : U32))
-  tree_head(pair_loop(32n, lv_list(lv_loop(U32.to_nat(count), Lv{w, crc_tables(), []}, (count - 1 : U32), count, n)), count, U32.is_eq(count, 1)))
+  tree_head(pair_loop(32n, lv_list(lv_loop(U32.to_nat(count), Lv{w, []}, (count - 1 : U32), count, n)), count, U32.is_eq(count, 1)))
 
-# Each leaf computes its CRC independently. crc_combine advances the left
-# remainder by the length of the right leaf, then folds in the right CRC, so
-# this balanced reduction is byte-for-byte equivalent to the serial pass.
-type Pc is Type:
-  Pc{crc: U32, n: U32}
-
-def ca_range_tail(st: Ca, +pos: U32, +rem: U32) -> Ca:
-  match st:
-    case Ca{w, t, c}:
-      ca_step(w4(w, pos), t, c, U32.to_nat(rem))
-
-def pc_of(r: Array<U32> & U32, +n: U32) -> Pc:
-  (w, crc) = r
-  Pc{crc, n}
-
-def crc_leaf(ck: Ck) -> Pc:
-  match ck:
-    case Ck{a, table, start, end, d, last}:
-      +ss = start
-      +n = (end - ss : U32)
-      +full = (n .&. 4294967292 : U32)
-      pc_of(ca_fin(ca_range_tail(ca8_all((full >> 2n : U32), Ca{a, table, 4294967295}, (ss >> 2n : U32)), (ss + full : U32), (n .&. 3 : U32))), n)
-
-def pc_join(l: Pc, r: Pc) -> Pc:
-  match l, r:
-    case Pc{lc, ln}, Pc{rc, rn}:
-      +rr = rn
-      Pc{crc_combine(lc, rc, rr), (ln + rr : U32)}
-
-# the chunk streams joined in order
-type Oc is Type:
-  Oc{src: Array<U32>, ob: Ob}
-
-def oc_put(r: Array<U32> & U32, ob: Ob) -> Oc:
-  (src, b) = r
-  Oc{src, ob_byte(ob, b)}
-
-def oc_loop(n: Nat, st: Oc, +j: U32) -> Oc:
-  match n, st:
-    case 0n, r:
-      r
-    case 1n+p, Oc{src, ob}:
-      oc_loop(p, oc_put(wb(src, j), ob), (j + 1 : U32))
-
-def oc_ob(st: Oc) -> Ob:
-  match st:
-    case Oc{src, ob}:
-      ob
-
-def ob_append(ob: Ob, part: Ob) -> Ob:
-  match part:
-    case Ob{a, cap, pos}:
-      oc_ob(oc_loop(U32.to_nat(pos), Oc{a, ob}, 0))
-
-def join_tree(t: Ot, ob: Ob) -> Ob:
-  match t:
-    case OLeaf{part}:
-      ob_append(ob, part)
-    case ONode{l, r}:
-      join_tree(r, join_tree(l, ob))
-
+# A compressed leaf already ends on a byte boundary. Keep the leaves separate
+# so IO can write them in order without copying them into another Bend Array.
 def stored_bw(r: Array<U32> & Bw) -> Bw:
   (w, bw) = r
   bw
 
-# level 0 is the whole input stored; the rest is chunked and forked
-def deflate_go(w: Array<U32>, +n: U32, +level: U32, ob: Ob, stored: Bool) -> Ob:
+def deflate_parts_go(w: Array<U32>, +n: U32, +level: U32, stored: Bool) -> Ot:
   match stored:
     case True{}:
-      bw_fin(stored_bw(stored_out(w, Bw{ob, 0, 0, False{}}, 0, n, True{})))
+      OLeaf{bw_fin(stored_bw(stored_out(w, Bw{ob_new(), 0, 0, False{}}, 0, n, True{})))}
     case False{}:
-      join_tree(par_tree(chunks(w, n), cf_of(level)), ob)
+      par_tree(chunks(w, n), cf_of(level))
 
-def deflate(w: Array<U32>, +n: U32, +level: U32, ob: Ob) -> Ob:
-  deflate_go(w, n, level, ob, U32.is_eq(level, 0))
+def deflate_parts(w: Array<U32>, +n: U32, +level: U32) -> Ot:
+  deflate_parts_go(w, n, level, U32.is_eq(level, 0))
 
 # XFL says 2 for the slowest level and 4 for the fastest
 def gz_head(ob: Ob, +level: U32) -> Ob:
@@ -3139,80 +2924,40 @@ def gz_head(ob: Ob, +level: U32) -> Ob:
 def le32_put(ob: Ob, +v: U32) -> Ob:
   ob_byte(ob_byte(ob_byte(ob_byte(ob, (v .&. 255 : U32)), ((v >> 8n) .&. 255 : U32)), ((v >> 16n) .&. 255 : U32)), (v >> 24n : U32))
 
-# Compression and CRC share the same task tree. Keeping both results in each
-# leaf lets the runtime schedule checksum work with the already parallel
-# DEFLATE chunks instead of demanding one whole top-level branch first.
-type Bt is Type:
-  BLeaf{ob: Ob, pc: Pc}
-  BNode{l: Bt, r: Bt}
+def parts_list(parts: Ot, rest: List<&1, Ob>) -> List<&1, Ob>:
+  match parts:
+    case OLeaf{ob}:
+      ob <> rest
+    case ONode{l, r}:
+      parts_list(l, parts_list(r, rest))
 
-def ck_both_pair(arrays: Array<U32> & Array<U32>, table: Array<U32>, +start: U32, +end: U32, +d: U32, +last: Bool, +cf: Cf) -> Bt:
-  match arrays:
-    case (crc_words, deflate_words):
-      ob pc = ck_run_at(deflate_words, start, end, d, last, cf) crc_leaf(Ck{crc_words, table, start, end, d, last})
-      BLeaf{ob, pc}
+def stream_parts(parts: List<&1, Ob>, +path: String, file: File) -> IO(File):
+  match parts:
+    case Nil{}:
+      IO.pure(File, file)
+    case Con{h, t}:
+      do IO<File>:
+        next : File <- file_write_ob(path, file, h)
+        stream_parts(t, path, next)
 
-def ck_both(ck: Ck, +cf: Cf) -> Bt:
-  match ck:
-    case Ck{a, table, start, end, d, last}:
-      +ss = start
-      +ee = end
-      +dd = d
-      +ll = last
-      ck_both_pair(Array.fork(U32, a), table, ss, ee, dd, ll, cf)
+def gzip_stream_got(+path: String, file: File, r: Array<U32> & U32, +n: U32, +level: U32) -> IO(Unit):
+  (a, crc) = r
+  do IO<Unit>:
+    body : File <- file_write_ob(path, file, gz_head(ob_new(), level))
+    tail : File <- stream_parts(parts_list(deflate_parts(a, n, level), []), path, body)
+    done : File <- file_write_ob(path, tail, le32_put(le32_put(ob_new(), crc), n))
+    File.close(done)
 
-def par_both(t: Cq, +cf: Cf) -> Bt:
-  match t:
-    case CLeaf{ck}:
-      ck_both(ck, cf)
-    case CNode{l, r}:
-      a b = par_both(l, cf) par_both(r, cf)
-      BNode{a, b}
-
-type Ga is Type:
-  Ga{ob: Ob, pc: Pc}
-
-def ga_leaf(part: Ob, leaf_pc: Pc, acc: Ga) -> Ga:
-  match acc:
-    case Ga{ob, pc}:
-      Ga{ob_append(ob, part), pc_join(pc, leaf_pc)}
-
-def join_both(t: Bt, acc: Ga) -> Ga:
-  match t:
-    case BLeaf{part, pc}:
-      ga_leaf(part, pc, acc)
-    case BNode{l, r}:
-      join_both(r, join_both(l, acc))
-
-def gz_both_done(st: Ga, +n: U32) -> Ob:
+# The input remains shared by the parallel DEFLATE leaves. The checksum uses
+# the native CRC primitive, and each completed leaf goes straight to the file.
+def gzip_stream(+path: String, st: Ob, +level: U32) -> IO(Unit):
   match st:
-    case Ga{ob, Pc{crc, crc_n}}:
-      le32_put(le32_put(ob, crc), n)
-
-def gzip_chunked(a: Array<U32>, +n: U32, +level: U32) -> Ob:
-  gz_both_done(join_both(par_both(chunks(a, n), cf_of(level)), Ga{gz_head(ob_new(), level), Pc{0, 0}}), n)
-
-def gz_serial(r: Array<U32> & U32, +n: U32, +level: U32) -> Ob:
-  (w, crc) = r
-  le32_put(le32_put(deflate(w, n, level, gz_head(ob_new(), level)), crc), n)
-
-def gzip_go(a: Array<U32>, +n: U32, +level: U32, stored: Bool) -> Ob:
-  match stored:
-    case True{}:
-      gz_serial(crc32(a, n), n, level)
-    case False{}:
-      gzip_chunked(a, n, level)
-
-# the archive's words, gzipped into a fresh sink
-def gzip(a: Array<U32>, +n: U32, +level: U32) -> Ob:
-  gzip_go(a, n, level, U32.is_eq(level, 0))
-
-def gz_of(st: Ob, gz: Bool, +level: U32) -> Ob:
-  match st, gz:
-    case Ob{a, cap, pos}, True{}:
-      gzip(a, pos, level)
-    case Ob{a, cap, pos}, False{}:
-      Ob{a, cap, pos}
+    case Ob{a, cap, pos}:
+      +n = pos
+      do IO<Unit>:
+        checked : Array<U32> & U32 <- crc_words(path, a, n)
+        file : File <- open_out(path)
+        gzip_stream_got(path, file, checked, n, level)
 
 # Command line
 # ------------
@@ -3315,7 +3060,7 @@ def create_out(gz: Bool, verbose: Bool, +file: String, +level: U32, members: Lis
     case True{}:
       do IO<Unit>:
         st : Ob <- tar_pack(members, verbose, ob_new())
-        ob_write(path_out(file), gz_of(st, True{}, level))
+        gzip_stream(path_out(file), st, level)
     case False{}:
       tar_stream(members, verbose, path_out(file), True{})
 
