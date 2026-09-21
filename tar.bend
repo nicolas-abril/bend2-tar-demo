@@ -3037,26 +3037,14 @@ def bk_loop(fuel: Nat, st: Bk, +cf: Cf, +last: Bool) -> Bk:
         case False{}:
           bk_loop(p, bk_emit(lz_loop(U32.to_nat(32772), lz, cf), bw, last), cf, last)
 
-def lz_drop(lz: Lz, bw: Bw) -> Bw:
-  match lz:
-    case Lz{w, hd, prev, ts, i, n, pl, pd, pend, done, stop}:
-      bw
-
-def bk_bw(st: Bk) -> Bw:
-  match st:
-    case Bk{lz, bw, fin}:
-      lz_drop(lz, bw)
-
 # Chunks
 # ------
-# the input in chunks of 519168 bytes. The 5 KiB margin keeps an
-# incompressible chunk plus DEFLATE framing inside a 512 KiB output Array.
-# Array.fork gives every chunk a
-# read-only handle to the same block in O(1); the 32768 bytes before its
-# start are the dictionary the tables see first. A chunk's
-# stream ends byte aligned with an empty stored block unless it is the
-# last, so the streams concatenate. The chunks form a balanced tree,
-# and a parallel let forks over it.
+# A scheduler task owns up to 1015808 bytes and emits them as eight smaller
+# 126976-byte DEFLATE streams. The task keeps its matcher tables between those
+# streams, so only its first stream builds the preceding 32768-byte dictionary.
+# Each stream ends byte aligned with an empty stored block unless it is the
+# last, so all task outputs concatenate in input order. Array.fork gives every
+# task a read-only handle to the same batch in O(1).
 
 type Ck is Type:
   Ck{a: Array<U32>, start: U32, n: U32, d: U32, last: Bool}
@@ -3081,24 +3069,80 @@ def ck_fin(bw: Bw, last: Bool) -> Ob:
     case False{}:
       bw_fin(stored_empty(bw))
 
-def ck_end(st: Bk, last: Bool) -> Ob:
-  ck_fin(bk_bw(st), last)
+type Kc is Type:
+  Kc{ht: In, ob: Ob}
 
-# the chunk's stream: the dictionary goes into the tables, the pass
-# starts past it
-def ck_go(ht: In, +i0: U32, +n: U32, +cf: Cf, +last: Bool) -> Ob:
+type Gs is Type:
+  Gs{ht: In, rev: List<&1, Ob>, pos: U32, end: U32, final: Bool, done: Bool}
+
+def ck_keep_lz(lz: Lz, bw: Bw, last: Bool) -> Kc:
+  match lz:
+    case Lz{w, hd, prev, ts, i, n, pl, pd, pend, done, stop}:
+      Kc{In{w, hd, prev}, ck_fin(bw, last)}
+
+def ck_keep(st: Bk, last: Bool) -> Kc:
+  match st:
+    case Bk{lz, bw, fin}:
+      ck_keep_lz(lz, bw, last)
+
+# One stream starts at i0 with the task's current matcher tables.
+def ck_go(ht: In, +i0: U32, +n: U32, +cf: Cf, +last: Bool) -> Kc:
   match ht:
     case In{w, hd, prev}:
       +dn = U32.is_ge(i0, n)
-      ck_end(bk_loop(U32.to_nat(((n - i0) / 16384 + 2 : U32)), Bk{Lz{w, hd, prev, ts_new(), i0, n, 0, 0, False{}, dn, dn}, Bw{ob_new(), 0, 0, False{}}, False{}}, cf, last), last)
+      ck_keep(bk_loop(U32.to_nat(((n - i0) / 16384 + 2 : U32)), Bk{Lz{w, hd, prev, ts_new(), i0, n, 0, 0, False{}, dn, dn}, Bw{Ob{Array.new(U32, 15n, 0), 32768, 0}, 0, 0, False{}}, False{}}, cf, last), last)
 
-def ck_run_at(a: Array<U32>, +start: U32, +n: U32, +d: U32, last: Bool, +cf: Cf) -> Ob:
+def group_advance(cur: Kc, rev: List<&1, Ob>, +next: U32, +end: U32, final: Bool, done: Bool) -> Gs:
+  match cur:
+    case Kc{ht, ob}:
+      Gs{ht, ob <> rev, next, end, final, done}
+
+def group_step(st: Gs, +cf: Cf) -> Gs:
+  match st:
+    case Gs{ht, rev, pos, end, final, True{}}:
+      Gs{ht, rev, pos, end, final, True{}}
+    case Gs{ht, rev, pos, end, final, False{}}:
+      +pp = pos
+      +ee = end
+      +fin = final
+      +left = (ee - pp : U32)
+      +next = (pp + pick(U32.is_lt(left, 126976), left, 126976) : U32)
+      +done = U32.is_eq(next, ee)
+      group_advance(ck_go(ht, pp, next, cf, fin && done), rev, next, ee, fin, done)
+
+def group_loop(fuel: Nat, st: Gs, +cf: Cf) -> Gs:
+  match fuel, st:
+    case 0n, r:
+      r
+    case 1n+p, Gs{ht, rev, pos, end, final, done}:
+      group_loop(p, group_step(Gs{ht, rev, pos, end, final, done}, cf), cf)
+
+def group_outputs(rest: List<&1, Ob>, out: Ot) -> Ot:
+  match rest:
+    case Nil{}:
+      out
+    case Con{ob, tail}:
+      group_outputs(tail, ONode{OLeaf{ob}, out})
+
+def group_release(ht: In, rev: List<&1, Ob>) -> Ot:
+  match ht, rev:
+    case In{w, hd, prev}, Con{ob, rest}:
+      group_outputs(rest, OLeaf{ob})
+    case In{w, hd, prev}, Nil{}:
+      OLeaf{ob_new()}
+
+def group_out(st: Gs) -> Ot:
+  match st:
+    case Gs{ht, rev, pos, end, final, done}:
+      group_release(ht, rev)
+
+def ck_run_at(a: Array<U32>, +start: U32, +n: U32, +d: U32, last: Bool, +cf: Cf) -> Ot:
   +ss = start
   +dd = d
   +nn = n
-  ck_go(ins_loop(U32.to_nat(dd), In{a, Array.new(U32, 15n, 0), Array.new(U32, 15n, 0)}, (ss - dd : U32), nn), ss, nn, cf, last)
+  group_out(group_loop(8n, Gs{ins_loop(U32.to_nat(dd), In{a, Array.new(U32, 15n, 0), Array.new(U32, 15n, 0)}, (ss - dd : U32), nn), [], ss, nn, last, False{}}, cf))
 
-def ck_run(ck: Ck, +cf: Cf) -> Ob:
+def ck_run(ck: Ck, +cf: Cf) -> Ot:
   match ck:
     case Ck{a, start, n, d, last}:
       ck_run_at(a, start, n, d, last, cf)
@@ -3109,10 +3153,10 @@ def ck_run(ck: Ck, +cf: Cf) -> Ob:
 def par_tree(t: Cq, +cf: Cf) -> Ot:
   match t:
     case CLeaf{ck}:
-      OLeaf{ck_run(ck, cf)}
+      ck_run(ck, cf)
     case CPair{l, r}:
       a b = ck_run(l, cf) ck_run(r, cf)
-      ONode{OLeaf{a}, OLeaf{b}}
+      ONode{a, b}
     case CNode{l, r}:
       a b = par_tree(l, cf) par_tree(r, cf)
       ONode{a, b}
@@ -3171,22 +3215,21 @@ def tree_head(l: List<&1, Cq>) -> Cq:
       tree_only(t, h)
 
 # A bounded batch starts with dictionary bytes carried from the preceding
-# batch, followed by two 507 KiB chunks per worker. At eight workers the input
-# and worst-case output each stay near 8 MiB while the scheduler has two jobs
-# per CPU for load balancing.
+# batch, followed by one eight-stream worker group per runtime worker. At eight
+# workers the input and worst-case output each stay near 8 MiB.
 def batch_lv_loop(m: Nat, st: Lv, +k: U32, +count: U32, +dict: U32, +n: U32, +final: Bool) -> Lv:
   match m, st:
     case 0n, r:
       r
     case 1n+p, Lv{w, acc}:
-      +s = (dict + k * 519168 : U32)
-      +left = (n - k * 519168 : U32)
-      +e = (s + pick(U32.is_lt(left, 519168), left, 519168) : U32)
+      +s = (dict + k * 1015808 : U32)
+      +left = (n - k * 1015808 : U32)
+      +e = (s + pick(U32.is_lt(left, 1015808), left, 1015808) : U32)
       +d = pick(U32.is_lt(s, 32768), s, 32768)
       batch_lv_loop(p, lv_add(Array.fork(U32, w), acc, s, e, d, final && U32.is_eq((k + 1 : U32), count)), (k - 1 : U32), count, dict, n, final)
 
 def batch_chunks(w: Array<U32>, +dict: U32, +n: U32, final: Bool) -> Cq:
-  +count = pick(U32.is_eq(n, 0), 1, ((n + 519167) / 519168 : U32))
+  +count = pick(U32.is_eq(n, 0), 1, ((n + 1015807) / 1015808 : U32))
   tree_head(pair_loop(32n, lv_list(batch_lv_loop(U32.to_nat(count), Lv{w, []}, (count - 1 : U32), count, dict, n, final)), count, U32.is_eq(count, 1)))
 
 # A compressed leaf already ends on a byte boundary. Keep the leaves separate
@@ -3218,15 +3261,16 @@ def batch_seed_pair(r: Array<U32> & Array<U32>, +cap: U32) -> IO(Ob):
     Unit <- drop_words(dict)
     return Ob{dst, cap, 32768}
 
-# Two larger chunks per worker keep the current wave bounded while giving each
-# worker enough sequential compression to amortize setup and ordered writes.
+# Keep one long-lived compression group per worker. Round odd counts up so the
+# bottom scheduler layer contains only explicit pairs rather than an inline
+# leaf competing with their work.
 def batch_chunk_budget(+workers: U32) -> U32:
   +w = pick(U32.is_eq(workers, 0), 1, workers)
-  +want = (w * 2 : U32)
-  pick(U32.is_gt(want, 63), 63, want)
+  +want = pick(U32.is_eq(w, 1), 1, (w + (w .&. 1 : U32) : U32))
+  pick(U32.is_gt(want, 62), 62, want)
 
 def batch_depth(+chunks: U32) -> U32:
-  fit(31n, 0, (((32768 + chunks * 519168 : U32) + 3 : U32) / 4 + 3 : U32), False{})
+  fit(31n, 0, (((32768 + chunks * 1015808 : U32) + 3 : U32) / 4 + 3 : U32), False{})
 
 def batch_cap(+depth: U32) -> U32:
   U32.shln(1, U32.to_nat(depth))
@@ -3336,7 +3380,7 @@ def gzip_bounded(+path: String, names: List<&2, String>, +verbose: Bool, +level:
     +chunks : U32 = batch_chunk_budget(thread_count)
     +depth : U32 = batch_depth(chunks)
     +cap : U32 = batch_cap(depth)
-    +payload : U32 = (chunks * 519168 : U32)
+    +payload : U32 = (chunks * 1015808 : U32)
     members : List<&1, Tm> <- tar_manifest(names, verbose)
     file : File <- open_out(path)
     body : File <- file_write_ob(path, file, gz_head(ob_new(), level))
