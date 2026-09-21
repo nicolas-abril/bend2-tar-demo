@@ -320,9 +320,9 @@ def words_write(path: String, a: Array<U32>, +start: U32, +n: U32) -> IO(Array<U
   import "./effs/words_write.c"
   import "./effs/words_write.js"
 
-def words_fill(path: String, a: Array<U32>, +start: U32, +n: U32) -> IO(Array<U32> & Result<&1, &1, U32 & String, Unit>):
-  import "./effs/words_fill.c"
-  import "./effs/words_fill.js"
+def words_fill_at(path: String, +file_off: U32, a: Array<U32>, +start: U32, +n: U32) -> IO(Array<U32> & Result<&1, &1, U32 & String, Unit>):
+  import "./effs/words_fill_at.c"
+  import "./effs/words_fill_at.js"
 
 def file_size(path: String) -> IO(Result<&1, &1, U32 & String, U32>):
   import "./effs/file_size.c"
@@ -332,9 +332,13 @@ def stream_append(path: String, a: Array<U32>, +header_n: U32, input: String, +p
   import "./effs/stream_append.c"
   import "./effs/stream_append.js"
 
-def words_crc32(a: Array<U32>, +start: U32, +n: U32) -> IO(Array<U32> & Result<&1, &1, U32 & String, U32>):
+def words_crc32(a: Array<U32>, +start: U32, +n: U32, +prior: U32) -> IO(Array<U32> & Result<&1, &1, U32 & String, U32>):
   import "./effs/words_crc32.c"
   import "./effs/words_crc32.js"
+
+def words_copy_range(src: Array<U32>, +src_at: U32, dst: Array<U32>, +dst_at: U32, +n: U32) -> IO(Array<U32> & Array<U32>):
+  import "./effs/words_copy_range.c"
+  import "./effs/words_copy_range.js"
 
 def File.write_words(file: File, a: Array<U32>, +start: U32, +n: U32) -> IO(File & Array<U32> & Result<&1, &1, U32 & String, Unit>):
   import "./effs/file_words_write.c"
@@ -396,9 +400,9 @@ def write_words(+path: String, a: Array<U32>, +start: U32, +n: U32) -> IO(Array<
     r : Array<U32> & Result<&1, &1, U32 & String, Unit> <- words_write(path, a, start, n)
     wr_done(path, r)
 
-def fill_words(+path: String, a: Array<U32>, +start: U32, +n: U32) -> IO(Array<U32>):
+def fill_words_at(+path: String, +file_off: U32, a: Array<U32>, +start: U32, +n: U32) -> IO(Array<U32>):
   do IO<Array<U32>>:
-    r : Array<U32> & Result<&1, &1, U32 & String, Unit> <- words_fill(path, a, start, n)
+    r : Array<U32> & Result<&1, &1, U32 & String, Unit> <- words_fill_at(path, file_off, a, start, n)
     wr_done(path, r)
 
 def drop_words(a: Array<U32>) -> IO(Unit):
@@ -415,9 +419,9 @@ def crc_got(what: String, r: Array<U32> & Result<&1, &1, U32 & String, U32>) -> 
         Unit <- io_fail(what, e)
         IO.die(Array<U32> & U32, 1, "unreachable")
 
-def crc_words(+what: String, a: Array<U32>, +n: U32) -> IO(Array<U32> & U32):
+def crc_words_update(+what: String, a: Array<U32>, +start: U32, +n: U32, +prior: U32) -> IO(Array<U32> & U32):
   do IO<Array<U32> & U32>:
-    r : Array<U32> & Result<&1, &1, U32 & String, U32> <- words_crc32(a, 0, n)
+    r : Array<U32> & Result<&1, &1, U32 & String, U32> <- words_crc32(a, start, n, prior)
     crc_got(what, r)
 
 def open_got(what: String, r: Result<&1, &1, U32 & String, File>) -> IO(File):
@@ -603,36 +607,97 @@ def tar_header(name: String, +size: U32) -> String:
 # Create
 # ------
 
-def ob_fill_at(+path: String, +n: U32, +pad: U32, st: Ob) -> IO(Ob):
-  match st:
-    case Ob{a, cap, pos}:
-      +p = pos
-      do IO<Ob>:
-        a2 : Array<U32> <- fill_words(path, a, p, n)
-        return Ob{a2, cap, (p + n + pad : U32)}
+# The bounded gzip source. Metadata is collected once, then the logical tar
+# stream is produced into fixed batches without constructing a whole archive.
+type Tm is Type:
+  Tm{name: String, size: U32}
 
-def ob_fill(+path: String, +n: U32, +pad: U32, st: Ob) -> IO(Ob):
-  match st:
-    case Ob{a, cap, pos}:
-      +p = pos
-      ob_fill_at(path, n, pad, ob_room(a, cap, p, (p + n + pad : U32)))
-
-# Gzip still needs a contiguous archive today, but members are read directly
-# into their final ranges, without a temporary file Array or copy loop.
-def tar_pack_sized(st: Ob, +name: String, +size: U32) -> IO(Ob):
-  ob_fill(name, size, pad512(size), ob_str(tar_header(name, size), st))
-
-def tar_pack(names: List<&2, String>, +verbose: Bool, st: Ob) -> IO(Ob):
+def tar_manifest(names: List<&2, String>, +verbose: Bool) -> IO(List<&1, Tm>):
   match names:
     case Nil{}:
-      IO.pure(Ob, ob_zero(st, 1024))
+      IO.pure(List<&1, Tm>, [])
     case Con{h, t}:
       +name = h
-      do IO<Ob>:
+      do IO<List<&1, Tm>>:
         size : U32 <- size_of(name)
         Unit <- say(verbose, "a " ++ name)
-        next : Ob <- tar_pack_sized(st, name, size)
-        tar_pack(t, verbose, next)
+        rest : List<&1, Tm> <- tar_manifest(t, verbose)
+        return Tm{name, size} <> rest
+
+type Gsrc is Type:
+  GFiles{members: List<&1, Tm>}
+  GData{name: String, size: U32, at: U32, rest: List<&1, Tm>}
+  GPad{rest: List<&1, Tm>, left: U32}
+  GZero{left: U32}
+  GDone{}
+
+type Bt is Type:
+  Bt{src: Gsrc, ob: Ob, done: Bool}
+
+def gs_data_next(+name: String, +size: U32, +at: U32, rest: List<&1, Tm>, done: Bool) -> Gsrc:
+  match done:
+    case True{}:
+      GPad{rest, pad512(size)}
+    case False{}:
+      GData{name, size, at, rest}
+
+def gs_pad_next(rest: List<&1, Tm>, +left: U32, done: Bool) -> Gsrc:
+  match done:
+    case True{}:
+      GFiles{rest}
+    case False{}:
+      GPad{rest, left}
+
+def gs_zero_next(+left: U32, done: Bool) -> Gsrc:
+  match done:
+    case True{}:
+      GDone{}
+    case False{}:
+      GZero{left}
+
+# At most 64 command-line words enter the parser, so 256 phase transitions are
+# enough even when a batch crosses every member header, body and padding run.
+def tar_batch_fill(fuel: Nat, more: Bool, src: Gsrc, ob: Ob, +limit: U32) -> IO(Bt):
+  match fuel, more, src, ob:
+    case f, m, GDone{}, out:
+      IO.pure(Bt, Bt{GDone{}, out, True{}})
+    case f, False{}, s, out:
+      IO.pure(Bt, Bt{s, out, False{}})
+    case 0n, True{}, s, out:
+      IO.pure(Bt, Bt{s, out, False{}})
+    case 1n+p, True{}, GFiles{Nil{}}, out:
+      tar_batch_fill(p, True{}, GZero{1024}, out, limit)
+    case 1n+p, True{}, GFiles{Con{Tm{name, size}, rest}}, Ob{a, cap, pos}:
+      +nm = name
+      +sz = size
+      +pp = pos
+      +next = (pp + 512 : U32)
+      tar_batch_fill(p, U32.is_lt(next, limit), GData{nm, sz, 0, rest}, ob_str(tar_header(nm, sz), Ob{a, cap, pp}), limit)
+    case 1n+p, True{}, GData{name, size, at, rest}, Ob{a, cap, pos}:
+      +nm = name
+      +sz = size
+      +aa = at
+      +pp = pos
+      +take = pick(U32.is_lt((sz - aa : U32), (limit - pp : U32)), (sz - aa : U32), (limit - pp : U32))
+      +next_at = (aa + take : U32)
+      +next_pos = (pp + take : U32)
+      do IO<Bt>:
+        a2 : Array<U32> <- fill_words_at(nm, aa, a, pp, take)
+        tar_batch_fill(p, U32.is_lt(next_pos, limit), gs_data_next(nm, sz, next_at, rest, U32.is_eq(next_at, sz)), Ob{a2, cap, next_pos}, limit)
+    case 1n+p, True{}, GPad{rest, left}, Ob{a, cap, pos}:
+      +ll = left
+      +pp = pos
+      +take = pick(U32.is_lt(ll, (limit - pp : U32)), ll, (limit - pp : U32))
+      +next_left = (ll - take : U32)
+      +next_pos = (pp + take : U32)
+      tar_batch_fill(p, U32.is_lt(next_pos, limit), gs_pad_next(rest, next_left, U32.is_eq(next_left, 0)), Ob{a, cap, next_pos}, limit)
+    case 1n+p, True{}, GZero{left}, Ob{a, cap, pos}:
+      +ll = left
+      +pp = pos
+      +take = pick(U32.is_lt(ll, (limit - pp : U32)), ll, (limit - pp : U32))
+      +next_left = (ll - take : U32)
+      +next_pos = (pp + take : U32)
+      tar_batch_fill(p, U32.is_lt(next_pos, limit), gs_zero_next(next_left, U32.is_eq(next_left, 0)), Ob{a, cap, next_pos}, limit)
 
 # The plain create path writes one member at a time. Headers stay in Bend;
 # the effect only transfers their packed words and copies the file into the
@@ -3045,16 +3110,6 @@ def lv_add(r: Array<U32> & Array<U32>, acc: List<&1, Cq>, +start: U32, +n: U32, 
   (w, chunk) = r
   Lv{w, CLeaf{Ck{chunk, start, n, d, last}} <> acc}
 
-def lv_loop(m: Nat, st: Lv, +k: U32, +count: U32, +n: U32) -> Lv:
-  match m, st:
-    case 0n, r:
-      r
-    case 1n+p, Lv{w, acc}:
-      +s = (k * 262144 : U32)
-      +e = (s + pick(U32.is_lt((n - s : U32), 262144), (n - s : U32), 262144) : U32)
-      +d = pick(U32.is_lt(s, 32768), s, 32768)
-      lv_loop(p, lv_add(Array.fork(U32, w), acc, s, e, d, U32.is_eq((k + 1 : U32), count)), (k - 1 : U32), count, n)
-
 def lv_list(st: Lv) -> List<&1, Cq>:
   match st:
     case Lv{w, acc}:
@@ -3093,9 +3148,24 @@ def tree_head(l: List<&1, Cq>) -> Cq:
     case Con{h, t}:
       tree_only(t, h)
 
-def chunks(w: Array<U32>, +n: U32) -> Cq:
+# A bounded batch starts with dict bytes carried from the preceding batch,
+# followed by up to sixty-three normal 256 KiB chunks. Sixty-three keeps the
+# complete input, including the dictionary and spare words, inside a
+# 2^22-word Array while giving the scheduler ample work to balance eight CPUs.
+def batch_lv_loop(m: Nat, st: Lv, +k: U32, +count: U32, +dict: U32, +n: U32, +final: Bool) -> Lv:
+  match m, st:
+    case 0n, r:
+      r
+    case 1n+p, Lv{w, acc}:
+      +s = (dict + k * 262144 : U32)
+      +left = (n - k * 262144 : U32)
+      +e = (s + pick(U32.is_lt(left, 262144), left, 262144) : U32)
+      +d = pick(U32.is_lt(s, 32768), s, 32768)
+      batch_lv_loop(p, lv_add(Array.fork(U32, w), acc, s, e, d, final && U32.is_eq((k + 1 : U32), count)), (k - 1 : U32), count, dict, n, final)
+
+def batch_chunks(w: Array<U32>, +dict: U32, +n: U32, final: Bool) -> Cq:
   +count = pick(U32.is_eq(n, 0), 1, ((n + 262143) / 262144 : U32))
-  tree_head(pair_loop(32n, lv_list(lv_loop(U32.to_nat(count), Lv{w, []}, (count - 1 : U32), count, n)), count, U32.is_eq(count, 1)))
+  tree_head(pair_loop(32n, lv_list(batch_lv_loop(U32.to_nat(count), Lv{w, []}, (count - 1 : U32), count, dict, n, final)), count, U32.is_eq(count, 1)))
 
 # A compressed leaf already ends on a byte boundary. Keep the leaves separate
 # so IO can write them in order without copying them into another Bend Array.
@@ -3103,15 +3173,25 @@ def stored_bw(r: Array<U32> & Bw) -> Bw:
   (w, bw) = r
   bw
 
-def deflate_parts_go(w: Array<U32>, +n: U32, +level: U32, stored: Bool) -> Ot:
+def deflate_batch_go(w: Array<U32>, +dict: U32, +n: U32, +level: U32, final: Bool, stored: Bool) -> Ot:
   match stored:
     case True{}:
-      OLeaf{bw_fin(stored_bw(stored_out(w, Bw{ob_new(), 0, 0, False{}}, 0, n, True{})))}
+      OLeaf{bw_fin(stored_bw(stored_out(w, Bw{ob_new(), 0, 0, False{}}, dict, n, final)))}
     case False{}:
-      par_tree(chunks(w, n), cf_of(level))
+      par_tree(batch_chunks(w, dict, n, final), cf_of(level))
 
-def deflate_parts(w: Array<U32>, +n: U32, +level: U32) -> Ot:
-  deflate_parts_go(w, n, level, U32.is_eq(level, 0))
+def deflate_batch(w: Array<U32>, +dict: U32, +n: U32, +level: U32, final: Bool) -> Ot:
+  deflate_batch_go(w, dict, n, level, final, U32.is_eq(level, 0))
+
+type Gc is Type:
+  Gc{src: Array<U32>, next: Ob}
+
+def batch_carry_pair(r: Array<U32> & Array<U32>) -> Gc:
+  (src, dst) = r
+  Gc{src, Ob{dst, 4194304, 32768}}
+
+def batch_new() -> Ob:
+  Ob{Array.new(U32, 22n, 0), 4194304, 0}
 
 # XFL says 2 for the slowest level and 4 for the fastest
 def gz_head(ob: Ob, +level: U32) -> Ob:
@@ -3136,24 +3216,83 @@ def stream_parts(parts: List<&1, Ob>, +path: String, file: File) -> IO(File):
         next : File <- file_write_ob(path, file, h)
         stream_parts(t, path, next)
 
-def gzip_stream_got(+path: String, file: File, r: Array<U32> & U32, +n: U32, +level: U32) -> IO(Unit):
-  (a, crc) = r
-  do IO<Unit>:
-    body : File <- file_write_ob(path, file, gz_head(ob_new(), level))
-    tail : File <- stream_parts(parts_list(deflate_parts(a, n, level), []), path, body)
-    done : File <- file_write_ob(path, tail, le32_put(le32_put(ob_new(), crc), n))
-    File.close(done)
+type Gst is Type:
+  GFill{src: Gsrc, ob: Ob, dict: U32, file: File, crc: U32, total: U32}
+  GHave{built: Bt, dict: U32, file: File, crc: U32, total: U32}
+  GChecked{src: Gsrc, checked: Array<U32> & U32, dict: U32, n: U32, pos: U32, file: File, total: U32, done: Bool}
+  GCarry{src: Gsrc, carry: Gc, dict: U32, n: U32, file: File, crc: U32, total: U32}
 
-# The input remains shared by the parallel DEFLATE leaves. The checksum uses
-# the native CRC primitive, and each completed leaf goes straight to the file.
-def gzip_stream(+path: String, st: Ob, +level: U32) -> IO(Unit):
+def gzip_batch_stop(st: Gst) -> IO(Unit):
   match st:
-    case Ob{a, cap, pos}:
-      +n = pos
+    case GFill{src, Ob{a, cap, pos}, dict, file, crc, total}:
       do IO<Unit>:
-        checked : Array<U32> & U32 <- crc_words(path, a, n)
-        file : File <- open_out(path)
-        gzip_stream_got(path, file, checked, n, level)
+        Unit <- drop_words(a)
+        Unit <- File.close(file)
+        IO.die(Unit, 1, "tar: gzip batch limit")
+    case GHave{Bt{src, Ob{a, cap, pos}, done}, dict, file, crc, total}:
+      do IO<Unit>:
+        Unit <- drop_words(a)
+        Unit <- File.close(file)
+        IO.die(Unit, 1, "tar: gzip batch limit")
+    case GChecked{src, (a, crc), dict, n, pos, file, total, done}:
+      do IO<Unit>:
+        Unit <- drop_words(a)
+        Unit <- File.close(file)
+        IO.die(Unit, 1, "tar: gzip batch limit")
+    case GCarry{src, Gc{a, Ob{b, cap, pos}}, dict, n, file, crc, total}:
+      do IO<Unit>:
+        Unit <- drop_words(a)
+        Unit <- drop_words(b)
+        Unit <- File.close(file)
+        IO.die(Unit, 1, "tar: gzip batch limit")
+
+def gzip_batches(fuel: Nat, st: Gst, +level: U32, +path: String) -> IO(Unit):
+  match fuel, st:
+    case 0n, r:
+      gzip_batch_stop(r)
+    case 1n+p, GFill{src, ob, dict, file, crc, total}:
+      +dd = dict
+      do IO<Unit>:
+        built : Bt <- tar_batch_fill(256n, True{}, src, ob, (dd + 16515072 : U32))
+        gzip_batches(p, GHave{built, dd, file, crc, total}, level, path)
+    case 1n+p, GHave{Bt{src, Ob{a, cap, pos}, done}, dict, file, crc, total}:
+      +dd = dict
+      +pp = pos
+      +nn = (pp - dd : U32)
+      do IO<Unit>:
+        checked : Array<U32> & U32 <- crc_words_update(path, a, dd, nn, crc)
+        gzip_batches(p, GChecked{src, checked, dd, nn, pp, file, total, done}, level, path)
+    case 1n+p, GChecked{src, (a, crc), dict, n, pos, file, total, True{}}:
+      +dd = dict
+      +nn = n
+      +cc = crc
+      +tt = (total + nn : U32)
+      do IO<Unit>:
+        body : File <- stream_parts(parts_list(deflate_batch(a, dd, nn, level, True{}), []), path, file)
+        tail : File <- file_write_ob(path, body, le32_put(le32_put(ob_new(), cc), tt))
+        File.close(tail)
+    case 1n+p, GChecked{src, (a, crc), dict, n, pos, file, total, False{}}:
+      +dd = dict
+      +nn = n
+      +pp = pos
+      +cc = crc
+      +tt = (total + nn : U32)
+      do IO<Unit>:
+        carried : Array<U32> & Array<U32> <- words_copy_range(a, (pp - 32768 : U32), Array.new(U32, 22n, 0), 0, 32768)
+        gzip_batches(p, GCarry{src, batch_carry_pair(carried), dd, nn, file, cc, tt}, level, path)
+    case 1n+p, GCarry{src, Gc{a, next}, dict, n, file, crc, total}:
+      +dd = dict
+      +nn = n
+      do IO<Unit>:
+        tail : File <- stream_parts(parts_list(deflate_batch(a, dd, nn, level, False{}), []), path, file)
+        gzip_batches(p, GFill{src, next, 32768, tail, crc, total}, level, path)
+
+def gzip_bounded(+path: String, names: List<&2, String>, +verbose: Bool, +level: U32) -> IO(Unit):
+  do IO<Unit>:
+    members : List<&1, Tm> <- tar_manifest(names, verbose)
+    file : File <- open_out(path)
+    body : File <- file_write_ob(path, file, gz_head(ob_new(), level))
+    gzip_batches(U32.to_nat(4096), GFill{GFiles{members}, batch_new(), 0, body, 0, 0}, level, path)
 
 # Command line
 # ------------
@@ -3254,9 +3393,7 @@ def walk_in(r: Array<U32> & U32, gz: Bool, extract: Bool, verbose: Bool) -> IO(U
 def create_out(gz: Bool, verbose: Bool, +file: String, +level: U32, members: List<&2, String>) -> IO(Unit):
   match gz:
     case True{}:
-      do IO<Unit>:
-        st : Ob <- tar_pack(members, verbose, ob_new())
-        gzip_stream(path_out(file), st, level)
+      gzip_bounded(path_out(file), members, verbose, level)
     case False{}:
       tar_stream(members, verbose, path_out(file), True{})
 

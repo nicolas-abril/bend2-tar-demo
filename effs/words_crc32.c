@@ -3,12 +3,12 @@
 #include <arm_acle.h>
 #endif
 
-// IEEE CRC-32 over n bytes of a packed Array, starting at byte start.
-// The Array comes back outside the Result.
+// Incremental IEEE CRC-32 over n bytes of a packed Array, starting at byte
+// start. prior is the finalized CRC of preceding bytes. The Array comes back.
 #if defined(WORDS_HAVE_ARM_CRC)
 __attribute__((target("crc")))
-static u32 words_crc32_arm(const u8* p, uint64_t n) {
-  u32 crc = UINT32_MAX;
+static u32 words_crc32_arm(const u8* p, uint64_t n, u32 prior) {
+  u32 crc = prior ^ UINT32_MAX;
   while (n >= 8) {
     uint64_t v;
     memcpy(&v, p, sizeof v);
@@ -35,7 +35,7 @@ static u32 words_crc32_arm(const u8* p, uint64_t n) {
 }
 #endif
 
-static u32 words_crc32_portable(const u8* p, uint64_t n) {
+static u32 words_crc32_portable(const u8* p, uint64_t n, u32 prior) {
   u32 table[256];
   for (u32 i = 0; i < 256; i += 1) {
     u32 c = i;
@@ -44,7 +44,7 @@ static u32 words_crc32_portable(const u8* p, uint64_t n) {
     }
     table[i] = c;
   }
-  u32 crc = UINT32_MAX;
+  u32 crc = prior ^ UINT32_MAX;
   for (uint64_t i = 0; i < n; i += 1) {
     crc = table[(crc ^ p[i]) & 255] ^ (crc >> 8);
   }
@@ -55,11 +55,12 @@ Term words_crc32_run(Env e, Term* f, IoWork* w) {
   Term arr = f[0];
   uint64_t start = (uint64_t)(u32)f[1];
   uint64_t count = (uint64_t)(u32)f[2];
+  u32 prior = (u32)f[3];
   const u8* p = (const u8*)blk_ptr(e.mem, term_loc(arr), 0) + start;
 #if defined(WORDS_HAVE_ARM_CRC)
-  u32 crc = words_crc32_arm(p, count);
+  u32 crc = words_crc32_arm(p, count, prior);
 #else
-  u32 crc = words_crc32_portable(p, count);
+  u32 crc = words_crc32_portable(p, count, prior);
 #endif
   return io_tup(e, arr, io_done(e, (Term)crc));
 }

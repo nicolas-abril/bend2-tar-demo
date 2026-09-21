@@ -1,5 +1,5 @@
-// IEEE CRC-32 over n bytes of a packed Array, starting at byte start.
-function words_crc32(a, start, n) {
+// Incremental IEEE CRC-32; prior is the finalized CRC of preceding bytes.
+function words_crc32(a, start, n, prior) {
   const table = new Uint32Array(256);
   for (let i = 0; i < 256; i++) {
     let c = i;
@@ -8,7 +8,7 @@ function words_crc32(a, start, n) {
     }
     table[i] = c >>> 0;
   }
-  let crc = 0xffffffff;
+  let crc = (prior ^ 0xffffffff) >>> 0;
   for (let i = 0; i < n; i++) {
     const at = start + i;
     const b = (a[at >> 2] >>> (8 * (at & 3))) & 255;

@@ -9,7 +9,7 @@ Requires the `bend` CLI on `PATH` and a C compiler. With a neighboring
 A bsdtar-style archiver in Bend: create, list and extract ustar archives,
 gzip'd or not, with a DEFLATE encoder (dynamic Huffman over LZ77) and
 decoder written in Bend. `tar.c` is the C twin: the same layout, container,
-inflate and deflate, so the two produce byte-identical archives.
+inflate and deflate. Default-level archives remain byte-identical.
 
 A Bend binary takes no arguments, so the command line rides `TAR_ARGS` in
 bsdtar's spelling:
@@ -27,11 +27,11 @@ line and directory entries are skipped.
 Plain creation is streamed: Bend constructs each ustar header, then the sink
 effect writes that header, copies the member, and adds its padding in order.
 Member contents are never copied into a whole-archive array. Gzip creation
-reads members directly into their final packed ranges, then uses the parallel
-Bend DEFLATE implementation. Completed compressed chunks are written in order
-through one open file handle; they are not joined into a second whole-archive
-array. CRC-32 is a foreign packed-array primitive that uses ARM64 CRC
-instructions when available and a portable implementation elsewhere.
+builds the logical tar stream in bounded batches of up to sixty-three 256 KiB
+chunks. It carries the preceding 32 KiB dictionary into each batch, compresses
+the chunks in parallel, and writes the batch before producing the next one.
+CRC-32 is updated incrementally by a foreign packed-array primitive that uses
+ARM64 CRC instructions when available and a portable implementation elsewhere.
 
 Plain listing is streamed by reading one 512-byte header at a time from an
 open file and advancing past member payloads without reading them. Stdin keeps
