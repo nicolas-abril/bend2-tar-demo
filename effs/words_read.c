@@ -1,17 +1,15 @@
 // Words
 // =====
-//! use ../../bend2/effs/sys.c
-
 // the whole file packed four bytes to a word, little-endian, in a
 // buf block of 2^d u32 lanes with at least three spare words of zeros,
 // and its byte count
-Term words_read_run(Env e, Term* f) {
+Term words_read_run(Env e, Term* f, IoWork* w) {
   uint64_t n = 0;
   char* path = io_cstr(e, f[0], &n);
   FILE* fp = io_nul(path, n) ? NULL : fopen(path, "rb");
   if (fp == NULL) {
     free(path);
-    return io_fail(e, io_sys_fall(errno != 0 ? (uint32_t)errno : ENOENT));
+    return io_fail(e, errno != 0 ? (u32)errno : ENOENT, NULL);
   }
   free(path);
   uint64_t cap = 1 << 20;
@@ -48,5 +46,5 @@ Term words_read_run(Env e, Term* f) {
 }
 
 static void __attribute__((constructor)) words_read_use(void) {
-  io_eff(FID_WORDS_READ, CID_WORDS_READ, words_read_run);
+  io_eff(CID_WORDS_READ, words_read_run, 0);
 }

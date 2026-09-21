@@ -20,9 +20,15 @@ bsdtar's spelling:
 
 Flags: `c` create, `x` extract, `t` list, `f FILE` (`-` for stdin/stdout),
 `z` gzip, `v` verbose, `0`-`9` the gzip level (6 by default). Bytes ride
-packed word arrays through the two foreign effects under `effs/`. There is
+packed word arrays through the foreign effects under `effs/`. There is
 no mkdir or readdir, so an archive holds the files named on the command
 line and directory entries are skipped.
+
+Plain creation is streamed: Bend constructs each ustar header, then the sink
+effect writes that header, copies the member, and adds its padding in order.
+Member contents are never copied into a whole-archive array. Gzip creation
+reads members directly into their final packed ranges, then uses the parallel
+Bend DEFLATE implementation and its packed chunk arrays.
 
 `make` builds `tar`; `make smoke` builds both, archives two files with each,
 compares the archives byte for byte, lists, extracts and compares the files.

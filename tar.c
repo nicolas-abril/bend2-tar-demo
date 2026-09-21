@@ -474,7 +474,11 @@ static void lz_block(Lz *z, Cf cf) {
       u32 cl = too_far(bl, bd), cd = bd;
       if (z->pl >= 3 && cl <= z->pl) {
         u32 pl = z->pl, pd = z->pd;
-        for (u32 j = i + 1; j + 1 < i + pl; j++) ins_at(z, j);
+        if (pl <= cf.lazy) {
+          for (u32 j = i + 1; j + 1 < i + pl; j++) ins_at(z, j);
+        } else {
+          for (u32 j = i + 1; j + 1 < i + pl; j += 2) ins_at(z, j);
+        }
         z->i = i + pl - 1;
         z->pl = 0; z->pd = 0; z->pend = 0;
         z->done = z->i >= n;
@@ -622,6 +626,10 @@ static void emit_tok(Bw *w, const Tok *t, const u32 *lc, const u32 *ll, const u3
 static void block_out(Lz *z, Bw *w, int final) {
   u32 ll[512], dl[32], all[512], lc[512], dc[32], cl[19], clc[19];
   u32 start = z->i - (u32)z->pend - z->cov, cov = z->cov;
+  if (z->ntok * 100 > cov * 99) {
+    stored_out(w, z->inp, start, cov, final);
+    goto reset;
+  }
   z->fl[256]++;
   two_live(z->fl, 286);
   huff_lens(z->fl, 286, 15, ll);
@@ -663,6 +671,7 @@ static void block_out(Lz *z, Bw *w, int final) {
     bw_code(w, lc[256], ll[256]);
   }
   free(r.t);
+reset:
   z->ntok = 0; z->cov = 0;
   memset(z->fl, 0, sizeof z->fl);
   memset(z->fd, 0, sizeof z->fd);

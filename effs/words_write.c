@@ -1,10 +1,8 @@
 // Words
 // =====
-//! use ../../bend2/effs/sys.c
-
 // n bytes of the packed words from byte start into the file; the
 // words come back outside the Result
-Term words_write_run(Env e, Term* f) {
+Term words_write_run(Env e, Term* f, IoWork* w) {
   uint64_t n = 0;
   char* path = io_cstr(e, f[0], &n);
   Term arr = f[1];
@@ -13,7 +11,7 @@ Term words_write_run(Env e, Term* f) {
   FILE* fp = io_nul(path, n) ? NULL : fopen(path, "wb");
   if (fp == NULL) {
     free(path);
-    return io_tup(e, arr, io_fail(e, io_sys_fall(errno != 0 ? (uint32_t)errno : ENOENT)));
+    return io_tup(e, arr, io_fail(e, errno != 0 ? (u32)errno : ENOENT, NULL));
   }
   free(path);
   Loc loc = term_loc(arr);
@@ -33,11 +31,11 @@ Term words_write_run(Env e, Term* f) {
   int bad = count > 0 && fwrite(buf, 1, count, fp) != count;
   free(buf);
   if (fclose(fp) != 0 || bad) {
-    return io_tup(e, arr, io_fail(e, io_sys_fall(errno != 0 ? (uint32_t)errno : EIO)));
+    return io_tup(e, arr, io_fail(e, errno != 0 ? (u32)errno : EIO, NULL));
   }
   return io_tup(e, arr, io_done(e, term_pak(CID_UNIT, 0)));
 }
 
 static void __attribute__((constructor)) words_write_use(void) {
-  io_eff(FID_WORDS_WRITE, CID_WORDS_WRITE, words_write_run);
+  io_eff(CID_WORDS_WRITE, words_write_run, 0);
 }
