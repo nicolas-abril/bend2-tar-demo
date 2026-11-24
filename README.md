@@ -50,8 +50,9 @@ batch near 8 MiB while leaving enough independent work to balance uneven files
 and heterogeneous cores. Bend writes a completed batch before allocating and
 producing the next one and carries only the preceding 32 KiB dictionary between
 batches.
-The LZ77 chain walk keeps the current four-byte window across candidates, so a
-full candidate comparison reads only the candidate window from the input Array.
+The LZ77 matcher (gralha-deflate 0.1.0.1) chains on 4-byte hashes with a one-entry
+3-byte table beside them, and extends a candidate only when its four bytes at the
+start and at the best length both agree.
 CRC-32 is updated incrementally by `gralha-crc32`'s packed-array primitive, which uses
 ARM64 CRC instructions when available and a portable implementation elsewhere.
 
@@ -62,9 +63,9 @@ ISIZE up front, writes directly into packed output, copies stored data and
 backreferences four bytes at a time where possible, and uses a nine-bit primary
 Huffman table with a canonical fallback for longer codes.
 
-Speed, ratio and memory on the Silesia corpus against gzip, pigz, libdeflate, zstd,
-xz and others are in [BENCHMARKS.md](BENCHMARKS.md): gzip's ratio, 3.4x gzip's
-speed on 10 threads, 1.65x slower than zlib on one.
+Speed, ratio and memory on the Silesia corpus against gzip, pigz and libdeflate
+are in [BENCHMARKS.md](BENCHMARKS.md): gzip's ratio, zlib's speed on one thread,
+4.8x gzip on 10 threads and 1.19x behind pigz at -6.
 
 `make` builds `tar`; `make smoke` builds both, archives two files with each,
 compares the archives byte for byte (the inputs fit one task), lists, extracts and compares the files.

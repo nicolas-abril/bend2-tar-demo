@@ -188,9 +188,16 @@ static void crc_init(void) {
   }
 }
 
+#if defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+#endif
 static u32 crc32(const u8 *p, size_t n) {
   u32 c = 0xFFFFFFFFu;
-  for (size_t i = 0; i < n; i++) c = crc_tab[(c ^ p[i]) & 255] ^ (c >> 8);
+  size_t i = 0;
+#if defined(__ARM_FEATURE_CRC32)
+  for (; i + 8 <= n; i += 8) { uint64_t v; memcpy(&v, p + i, 8); c = __crc32d(c, v); }
+#endif
+  for (; i < n; i++) c = crc_tab[(c ^ p[i]) & 255] ^ (c >> 8);
   return c ^ 0xFFFFFFFFu;
 }
 
@@ -346,13 +353,19 @@ static Cf cf_of(int level) {
 }
 
 // bit writer
-typedef struct { Buf out; u32 buf, cnt; } Bw;
+typedef struct { Buf out; uint64_t buf; u32 cnt; } Bw;
 
+// k <= 32 bits; whole bytes leave once 32 or more are held
 static void bw_put(Bw *w, u32 v, u32 k) {
-  w->buf |= v << w->cnt;
+  w->buf |= (uint64_t)v << w->cnt;
   w->cnt += k;
-  while (w->cnt >= 8) { buf_push(&w->out, (u8)(w->buf & 255)); w->buf >>= 8; w->cnt -= 8; }
+  if (w->cnt >= 32) {
+    buf_reserve(&w->out, w->out.n + 8);
+    u32 lo = (u32)w->buf; memcpy(w->out.p + w->out.n, &lo, 4);
+    w->out.n += 4; w->buf >>= 32; w->cnt -= 32;
+  }
 }
+static void bw_flush(Bw *w) { while (w->cnt >= 8) { buf_push(&w->out, (u8)(w->buf & 255)); w->buf >>= 8; w->cnt -= 8; } }
 
 static u32 rev_bits(u32 c, u32 k) {
   u32 acc = 0;
@@ -360,16 +373,9 @@ static u32 rev_bits(u32 c, u32 k) {
   return acc;
 }
 
-static void bw_code(Bw *w, u32 code, u32 k) { bw_put(w, rev_bits(code, k), k); }
+static void bw_code(Bw *w, u32 rcode, u32 k) { bw_put(w, rcode, k); }
 
-static void bw_fin(Bw *w) { if (w->cnt > 0) buf_push(&w->out, (u8)(w->buf & 255)); }
-
-// the code index for a length or a distance: the last base <= v
-static u32 code_of(u32 v, const u32 *base, u32 count) {
-  u32 c = 0;
-  while (c + 1 < count && v >= base[c + 1]) c++;
-  return c;
-}
+static void bw_fin(Bw *w) { bw_flush(w); if (w->cnt > 0) buf_push(&w->out, (u8)(w->buf & 255)); w->cnt = 0; w->buf = 0; }
 
 typedef struct { u32 sym, ex, eb, ds, dx, db; } Tok;
 
@@ -378,7 +384,7 @@ typedef struct { u32 sym, ex, eb, ds, dx, db; } Tok;
 // lazy levels, and the flags: done for the input, stop for the block
 typedef struct {
   const u8 *inp; u32 n;
-  u32 hd[32768], prev[32768];
+  u32 hd[32768], prev[32768], h3t[32768], c3;
   Tok toks[16384]; u32 ntok, cov;
   u32 fl[512], fd[32];
   u32 i, pl, pd; int pend, done, stop;
@@ -397,7 +403,9 @@ static void tok_lit(Lz *z, u32 b) {
 }
 
 static void tok_len(Lz *z, u32 len, u32 dist) {
-  u32 c = code_of(len, len_base, 29), d = code_of(dist, dist_base, 30);
+  u32 l = len - 3, x = dist - 1;
+  u32 c = len == 258 ? 28 : l < 8 ? l : 4 * (31 - __builtin_clz(l)) - 4 + ((l >> (29 - __builtin_clz(l))) & 3);
+  u32 d = x < 4 ? x : 2 * (31 - __builtin_clz(x)) + ((x >> (30 - __builtin_clz(x))) & 1);
   Tok t = { 257 + c, len - len_base[c], len_extra[c], d, dist - dist_base[d], dist_extra[d] };
   z->fl[257 + c]++;
   z->fd[d]++;
@@ -407,41 +415,57 @@ static void tok_len(Lz *z, u32 len, u32 dist) {
 
 // position j into the tables; answers the previous head (a position + 1,
 // 0 for none), and 0 when fewer than 3 bytes remain
+static inline u32 rd32(const u8 *p) { u32 v; memcpy(&v, p, 4); return v; }
+static inline u32 hash4(u32 v) { return (v * 0x1E35A7BDu) >> 17; }
+static inline u32 hash3(u32 v) { return ((v << 8) * 0x1E35A7BDu) >> 17; }
+// position j into both tables: the 4-byte chain (answered) and the one-entry
+// 3-byte table (left in z->c3); 0 for none or when fewer than 4 bytes remain
 static u32 ins_at(Lz *z, u32 j) {
-  if (j + 2 >= z->n) return 0;
-  u32 h = (((u32)z->inp[j] << 10) ^ ((u32)z->inp[j + 1] << 5) ^ z->inp[j + 2]) & 32767;
+  z->c3 = 0;
+  if (j + 3 >= z->n) return 0;
+  u32 v = rd32(z->inp + j), h = hash4(v), g = hash3(v);
+  z->c3 = z->h3t[g]; z->h3t[g] = j + 1;
   u32 cand = z->hd[h];
   z->hd[h] = j + 1;
   z->prev[j & 32767] = cand;
   return cand;
 }
 
-// eight bytes a step; the first differing byte is the xor's low zero
-// bytes (the input is padded, and the length is clamped after)
-static u32 match_at(const Lz *z, u32 i, u32 dist) {
-  u32 maxlen = z->n - i < 258 ? z->n - i : 258, len = 0;
-  const u8 *a = z->inp + i, *b = z->inp + i - dist;
+// the match length past the first four agreeing bytes, eight bytes a step:
+// the first differing byte is the xor's low zero bytes (the input is
+// padded, and the length is clamped by the caller)
+static u32 extend(const u8 *a, const u8 *b, u32 maxlen) {
+  u32 len = 4;
   while (len < maxlen) {
     uint64_t wa, wb;
     memcpy(&wa, a + len, 8);
     memcpy(&wb, b + len, 8);
     uint64_t x = wa ^ wb;
-    if (x != 0) { len += (u32)(__builtin_ctzll(x) >> 3); break; }
+    if (x != 0) return len + (u32)(__builtin_ctzll(x) >> 3);
     len += 8;
   }
-  return len < maxlen ? len : maxlen;
+  return len;
 }
 
-// the chain walk with zlib's one-byte reject at the best length
+// a length-3 candidate from the 3-byte table, then the 4-byte chain: a
+// candidate is extended only when its first four bytes and the four ending
+// at the best length so far both agree
 static void chain(const Lz *z, u32 i, u32 cand, u32 cap, u32 nice, int search, u32 *bl, u32 *bd) {
   *bl = 0; *bd = 0;
-  u32 x = z->inp[i];
-  int more = search && cand != 0 && i - (cand - 1) <= 32768 && i + 2 < z->n && cap > 0;
+  if (!search || i + 3 >= z->n) return;
+  const u8 *in = z->inp + i;
+  u32 first = rd32(in), c3 = z->c3;
+  if (c3 != 0 && i - (c3 - 1) <= 32768 && ((rd32(z->inp + c3 - 1) ^ first) & 0xFFFFFF) == 0) { *bl = 3; *bd = i - (c3 - 1); }
+  u32 maxlen = z->n - i < 258 ? z->n - i : 258;
+  int more = cand != 0 && i - (cand - 1) <= 32768 && cap > 0;
   for (u32 left = cap; more; left--) {
     u32 c = cand, d = i - (c - 1);
-    if (x == z->inp[i + *bl - d]) {
-      u32 len = match_at(z, i, d);
-      if (len > *bl) { *bl = len; *bd = d; x = z->inp[i + *bl]; }
+    const u8 *m = in - d;
+    u32 b = *bl < 3 ? 3 : *bl;
+    if (b < maxlen && rd32(m + b - 3) == rd32(in + b - 3) && rd32(m) == first) {
+      u32 len = extend(in, m, maxlen);
+      if (len > maxlen) len = maxlen;
+      if (len > *bl) { *bl = len; *bd = d; }
     }
     u32 nx = z->prev[(c - 1) & 32767];
     cand = nx;
@@ -512,30 +536,32 @@ static void two_live(u32 *f, u32 n) {
 }
 
 static u32 build_once(const u32 *f0, u32 n, u32 *lens) {
-  u32 fq[1024], par[1024], cnt = n, mx = 0;
-  memset(fq, 0, sizeof fq);
-  memset(par, 0, sizeof par);
+  u32 fq[1024], par[1024], leaf[512], nl = 0, cnt = n, mx = 0;
+  // the live leaves by (count, index): a stable counting of the order
+  for (u32 i = 0; i < n; i++) if (f0[i]) leaf[nl++] = i;
+  for (u32 a = 1; a < nl; a++) { u32 v = leaf[a], b = a; while (b > 0 && f0[leaf[b - 1]] > f0[v]) { leaf[b] = leaf[b - 1]; b--; } leaf[b] = v; }
   memcpy(fq, f0, n * sizeof(u32));
-  for (u32 step = 0; step < n; step++) {
-    u32 b1 = 0xFFFFFFFFu, f1 = 0xFFFFFFFFu, b2 = 0xFFFFFFFFu, f2 = 0xFFFFFFFFu;
-    for (u32 j = 0; j < cnt; j++) {
-      u32 f = fq[j];
-      if (f != 0 && f < f1) { b2 = b1; f2 = f1; b1 = j; f1 = f; }
-      else if (f != 0 && f < f2) { b2 = j; f2 = f; }
+  u32 li = 0, qi = n;  // leaf cursor; internal nodes are n..cnt-1 in order
+  for (;;) {
+    u32 pick[2];
+    for (int k = 0; k < 2; k++) {
+      int has_l = li < nl, has_q = qi < cnt;
+      if (!has_l && !has_q) { pick[k] = 0xFFFFFFFFu; break; }
+      if (has_l && (!has_q || fq[leaf[li]] <= fq[qi])) pick[k] = leaf[li++]; else pick[k] = qi++;
     }
-    if (b2 == 0xFFFFFFFFu) break;
-    fq[b1] = 0; fq[b2] = 0; fq[cnt] = f1 + f2;
-    par[b1] = cnt; par[b2] = cnt;
+    if (pick[1] == 0xFFFFFFFFu || pick[0] == 0xFFFFFFFFu) break;
+    fq[cnt] = fq[pick[0]] + fq[pick[1]];
+    par[pick[0]] = cnt; par[pick[1]] = cnt;
     cnt++;
   }
   u32 root = cnt - 1;
+  // depths top down: a node's parent has a larger index
+  u32 dep[1024];
+  dep[root] = 0;
+  for (u32 k = root; k-- > 0;) if (k >= n || f0[k]) dep[k] = dep[par[k]] + 1;
   for (u32 i = 0; i < n; i++) {
-    lens[i] = 0;
-    if (f0[i] == 0) continue;
-    u32 node = i, depth = 0;
-    while (node != root) { node = par[node]; depth++; }
-    lens[i] = depth;
-    if (depth > mx) mx = depth;
+    lens[i] = f0[i] ? dep[i] : 0;
+    if (lens[i] > mx) mx = lens[i];
   }
   return mx;
 }
@@ -554,7 +580,7 @@ static void codes_of(const u32 *lens, u32 n, u32 *codes) {
   for (u32 i = 0; i < n; i++) cnt[lens[i]]++;
   cnt[0] = 0;
   for (u32 l = 0; l < 15; l++) { code = (code + cnt[l]) << 1; next[l + 1] = code; }
-  for (u32 i = 0; i < n; i++) codes[i] = lens[i] ? next[lens[i]]++ : 0;
+  for (u32 i = 0; i < n; i++) codes[i] = lens[i] ? rev_bits(next[lens[i]]++, lens[i]) : 0;
 }
 
 static u32 used(const u32 *lens, u32 n, u32 lo) {
@@ -597,7 +623,7 @@ static void rle(Rle *r, const u32 *all, u32 total) {
   }
 }
 
-static void bw_align(Bw *w) { bw_put(w, 0, (8 - w->cnt % 8) % 8); }
+static void bw_align(Bw *w) { bw_put(w, 0, (8 - w->cnt % 8) % 8); bw_flush(w); }
 
 // the bytes [start, start+cov) as stored blocks of up to 65535 bytes,
 // the final flag on the last when final; a size that is a multiple of

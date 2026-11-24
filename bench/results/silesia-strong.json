@@ -2,40 +2,40 @@
  {
   "name": "bzip2 -9",
   "cmd": "bsdtar -cf - dickens mozilla mr nci ooffice osdb reymont samba sao webster x-ray xml | bzip2 -9 > /Users/macolas/.claude-profiles/pool/jobs/54632bf2/tmp/work/o.bz2",
-  "wall_min": 9.815790583990747,
-  "wall_med": 9.815790583990747,
-  "cpu_med": 9.863691000000001,
-  "rss_max": 8896512,
+  "wall_min": 10.205704749998404,
+  "wall_med": 10.205704749998404,
+  "cpu_med": 9.986778,
+  "rss_max": 8929280,
   "size": 54593415,
   "raw": 211938580,
   "ratio": 3.8821271759606906,
   "check": "verified",
-  "load": 4.04248046875
+  "load": 5.04443359375
  },
  {
   "name": "xz -6 -T0",
   "cmd": "bsdtar -cf - dickens mozilla mr nci ooffice osdb reymont samba sao webster x-ray xml | xz -6 -T0 -c > /Users/macolas/.claude-profiles/pool/jobs/54632bf2/tmp/work/o.xz",
-  "wall_min": 11.246722875002888,
-  "wall_med": 11.246722875002888,
-  "cpu_med": 69.805659,
-  "rss_max": 1139687424,
+  "wall_min": 11.816010624999763,
+  "wall_med": 11.816010624999763,
+  "cpu_med": 70.431654,
+  "rss_max": 1139703808,
   "size": 49500656,
   "raw": 211938580,
   "ratio": 4.281530733653308,
   "check": "verified",
-  "load": 4.4384765625
+  "load": 5.94482421875
  },
  {
   "name": "zstd -19 -T0",
   "cmd": "bsdtar -cf - dickens mozilla mr nci ooffice osdb reymont samba sao webster x-ray xml | zstd -19 -T0 -q -c > /Users/macolas/.claude-profiles/pool/jobs/54632bf2/tmp/work/o.zst",
-  "wall_min": 16.34003620799922,
-  "wall_med": 16.34003620799922,
-  "cpu_med": 80.498779,
-  "rss_max": 864616448,
+  "wall_min": 16.724985167005798,
+  "wall_med": 16.724985167005798,
+  "cpu_med": 81.25636899999999,
+  "rss_max": 864698368,
   "size": 52849570,
   "raw": 211938580,
   "ratio": 4.010223356594954,
   "check": "verified",
-  "load": 4.61865234375
+  "load": 6.619140625
  }
 ]
